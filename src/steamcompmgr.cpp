@@ -8549,7 +8549,12 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
 		// Only pace windows the FPS limiter covers.
 		const bool entry_vblank = vblank && steamcompmgr_should_vblank_window( entry_win, vblank_idx, now );
 
-		if (entry.fifo && (!entry_vblank || fifo_win_seqs.count(entry.winSeq) > 0))
+		// The bottom screen's window is paced by its own panel (CBottomScreen
+		// takes the newest frame for each of its refreshes): waiting for this
+		// output's vblank, and the limiter's, only made its frames late.
+		const bool bPacedHere = !entry_win || !bottom_screen_shows( entry_win );
+
+		if (entry.fifo && bPacedHere && (!entry_vblank || fifo_win_seqs.count(entry.winSeq) > 0))
 		{
 			commits_before_their_time.push_back( entry );
 			continue;
