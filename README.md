@@ -1,3 +1,6 @@
+> **This fork's `dual-screen` branch** adds second-panel support for dual-screen
+> handhelds (AYN Thor). Work in progress; see [DUAL-SCREEN.md](DUAL-SCREEN.md).
+
 ## gamescope: the micro-compositor formerly known as steamcompmgr
 
 In an embedded session usecase, gamescope does the same thing as steamcompmgr, but with less extra copies and latency:
