@@ -6144,10 +6144,16 @@ get_win_icon(xwayland_ctx_t* ctx, steamcompmgr_win_t* w)
 	get_prop(ctx, w->xwayland().id, ctx->atoms.netWMIcon, *w->icon.get());
 }
 
+static bool bottom_screen_shows( const steamcompmgr_win_t *w );
+
 static void
 handle_desktop_window(steamcompmgr_win_t *w)
 {
 	if ( !w )
+		return;
+
+	// Sized for the bottom screen instead (CBottomScreen).
+	if ( w->isBottomScreen || bottom_screen_shows( w ) )
 		return;
 
 	if ( win_has_game_id( w ) || w->bIsSteamPid || w->bIsSteamWebHelperPid || w->bIsVRWebHelperPid )
@@ -10391,6 +10397,7 @@ namespace
 		uint64_t m_ulLastPng = 0;
 		std::optional<BottomScreenTouchTarget> m_oTouchTarget;
 		bool m_bRaisedForTouch = false;
+		uint64_t m_ulResizedAt = 0;
 		EShowing m_ePublishedShowing = EShowing::Absent;
 
 		static constexpr int k_nImages = 3;
@@ -10764,6 +10771,27 @@ namespace
 			const xwayland_ctx_t *ctx = w->xwayland().ctx;
 			if ( attr.x < 0 || attr.y < 0 || attr.x + attr.width > ctx->root_width || attr.y + attr.height > ctx->root_height )
 				XMoveWindow( ctx->dpy, w->xwayland().id, 0, 0 );
+		}
+
+		// The window as big as the turned panel, so it draws at the panel's
+		// resolution (an emulator then fits its screen in it) instead of
+		// being scaled up, or left at the main output's shape.
+		{
+			uint32_t uWidth = m_Info.uWidth, uHeight = m_Info.uHeight;
+			if ( m_Info.uRotation & 1u )
+				std::swap( uWidth, uHeight );
+			const xwayland_ctx_t *ctx = w->xwayland().ctx;
+			uWidth = std::min<uint32_t>( uWidth, ctx->root_width );
+			uHeight = std::min<uint32_t>( uHeight, ctx->root_height );
+			const auto &attr = w->xwayland().a;
+			const uint64_t ulNow = get_time_in_nanos();
+			// At most once a second, for an app that will not take the size.
+			if ( ( (uint32_t)attr.width != uWidth || (uint32_t)attr.height != uHeight ) &&
+				 ulNow - m_ulResizedAt >= 1'000'000'000ul )
+			{
+				m_ulResizedAt = ulNow;
+				XResizeWindow( ctx->dpy, w->xwayland().id, uWidth, uHeight );
+			}
 		}
 
 		HandleTouches( w );
