@@ -41,6 +41,7 @@
 #include <cstdint>
 #include <memory>
 #include <thread>
+#include <regex.h>
 #include <condition_variable>
 #include <mutex>
 #include <atomic>
@@ -4901,6 +4902,8 @@ found:;
 	return localGameFocused;
 }
 
+static bool bottom_screen_shows( const steamcompmgr_win_t *w );
+
  std::vector< steamcompmgr_win_t* > xwayland_ctx_t::GetPossibleFocusWindows()
  {
 	std::vector<steamcompmgr_win_t*> vecPossibleFocusWindows;
@@ -4909,7 +4912,8 @@ found:;
 	{
 		// Always skip system tray icons and overlays, and what the bottom
 		// screen shows
-		if ( w->isSysTrayIcon || w->isOverlay || w->isExternalOverlay || w->isBottomScreen )
+		if ( w->isSysTrayIcon || w->isOverlay || w->isExternalOverlay || w->isBottomScreen ||
+			 bottom_screen_shows( w ) )
 		{
 			continue;
 		}
@@ -6042,6 +6046,31 @@ get_size_hints(xwayland_ctx_t *ctx, steamcompmgr_win_t *w)
 	}
 }
 
+// Emulators' second-screen windows, which the bottom screen shows by
+// themselves: melonDS's extra windows ("[w2] [60/60] melonDS 1.0") and
+// Azahar's Separate Windows layout ("Azahar 2125 | Game | Secondary
+// Window", English UI). GAMESCOPE_BOTTOM_SCREEN_TITLES, a POSIX extended
+// regex, replaces these; set empty, no window is matched.
+static bool bottom_screen_title_match( const std::string &sTitle )
+{
+	static regex_t s_Regex;
+	static const bool s_bRegex = []
+	{
+		const char *pszTitles = getenv( "GAMESCOPE_BOTTOM_SCREEN_TITLES" );
+		if ( !pszTitles )
+			pszTitles = "^\\[(p[0-9]+:)?w([2-9]|[1-9][0-9])] .*melonDS|^Azahar .* [|] Secondary Window$";
+		if ( !pszTitles[0] )
+			return false;
+		if ( regcomp( &s_Regex, pszTitles, REG_EXTENDED | REG_NOSUB ) != 0 )
+		{
+			xwm_log.errorf( "GAMESCOPE_BOTTOM_SCREEN_TITLES is not a valid regex: %s", pszTitles );
+			return false;
+		}
+		return true;
+	}();
+	return s_bRegex && regexec( &s_Regex, sTitle.c_str(), 0, nullptr, 0 ) == 0;
+}
+
 static void
 get_win_title(xwayland_ctx_t *ctx, steamcompmgr_win_t *w, Atom atom)
 {
@@ -6075,6 +6104,7 @@ get_win_title(xwayland_ctx_t *ctx, steamcompmgr_win_t *w, Atom atom)
 		w->title = NULL;
 	}
 	w->utf8_title = is_utf8;
+	w->isBottomScreenByTitle = w->title && bottom_screen_title_match( *w->title );
 }
 
 static void
@@ -7579,7 +7609,13 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 
 		if (w)
 		{
+			const bool bWasBottomScreen = w->isBottomScreenByTitle;
 			get_win_title(ctx, w, ev->atom);
+			if ( w->isBottomScreenByTitle != bWasBottomScreen )
+			{
+				MakeFocusDirty();
+				hasRepaint = true;
+			}
 
 			for ( auto &iter : g_VirtualConnectorFocuses )
 			{
@@ -10292,10 +10328,12 @@ static void relay_mangoapp_control()
 }
 
 // The bottom screen (the AYN Thor's, leased to Barry Launcher's gamescope):
-// a window with GAMESCOPE_BOTTOM_SCREEN set is drawn there, fitted and
-// turned like the panel, while the main output and focus leave it out. The
-// panel is taken from the lease's holder while such a window is mapped, and
-// given back when none is. Drawing happens here on the compositor thread;
+// a window with GAMESCOPE_BOTTOM_SCREEN set, or else an emulator's
+// second-screen window (bottom_screen_title_match), is drawn there, fitted
+// and turned like the panel, while the main output and focus leave it out.
+// The panel is taken from the lease's holder while such a window is mapped,
+// and given back when none is; a window matched by title is left as any
+// window while the panel cannot be taken. Drawing happens here on the compositor thread;
 // scanning out, which blocks until the panel shows the frame, on its own.
 namespace
 {
@@ -10310,6 +10348,7 @@ namespace
 	{
 	public:
 		void Tick();
+		bool Shows( const steamcompmgr_win_t *w ) const { return m_bHeld && w == m_pShown; }
 
 	private:
 		steamcompmgr_win_t *FindWindow();
@@ -10319,6 +10358,8 @@ namespace
 		static constexpr int k_nImages = 3;
 
 		bool m_bHeld = false;
+		// Compared only, never followed: FindWindow renews it every tick.
+		const steamcompmgr_win_t *m_pShown = nullptr;
 		uint64_t m_ulRetryAt = 0;
 		BottomScreenInfo m_Info = {};
 		gamescope::Rc<CVulkanTexture> m_pImages[ k_nImages ];
@@ -10335,17 +10376,23 @@ namespace
 
 	steamcompmgr_win_t *CBottomScreen::FindWindow()
 	{
+		// The property first, then titles.
+		steamcompmgr_win_t *pByTitle = nullptr;
 		gamescope_xwayland_server_t *server = nullptr;
 		for ( size_t i = 0; ( server = wlserver_get_xwayland_server( i ) ); i++ )
 		{
 			for ( steamcompmgr_win_t *w = server->ctx->list; w; w = w->xwayland().next )
 			{
-				if ( w->isBottomScreen && w->xwayland().a.map_state == IsViewable &&
-					 get_window_last_done_commit_peek( w ) )
+				if ( !( w->isBottomScreen || w->isBottomScreenByTitle ) ||
+					 w->xwayland().a.map_state != IsViewable || !get_window_last_done_commit_peek( w ) )
+					continue;
+				if ( w->isBottomScreen )
 					return w;
+				if ( !pByTitle )
+					pByTitle = w;
 			}
 		}
-		return nullptr;
+		return pByTitle;
 	}
 
 	void CBottomScreen::PresentThread()
@@ -10383,7 +10430,9 @@ namespace
 		}
 		drm_bottom_screen_release();
 		m_bHeld = false;
+		m_pShown = nullptr;
 		m_ulLastCommitID = 0;
+		MakeFocusDirty();
 		// The images stay: the panel may scan one out until the lease's
 		// holder has set its own again.
 	}
@@ -10424,6 +10473,7 @@ namespace
 			}
 			m_Info = info;
 			m_bHeld = true;
+			m_pShown = nullptr;
 			m_ulLastCommitID = 0;
 			if ( !m_bThreadStarted )
 			{
@@ -10431,6 +10481,14 @@ namespace
 				std::thread( [this] { PresentThread(); } ).detach();
 				m_bThreadStarted = true;
 			}
+		}
+
+		if ( w != m_pShown )
+		{
+			// Leaves focus, or gets it back, from here on.
+			m_pShown = w;
+			m_ulLastCommitID = 0;
+			MakeFocusDirty();
 		}
 
 		commit_t *pCommit = get_window_last_done_commit_peek( w );
@@ -10495,6 +10553,11 @@ namespace
 		static CBottomScreen *s_pBottomScreen = new CBottomScreen;
 		return *s_pBottomScreen;
 	}
+}
+
+static bool bottom_screen_shows( const steamcompmgr_win_t *w )
+{
+	return BottomScreen().Shows( w );
 }
 
 void

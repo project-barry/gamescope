@@ -121,6 +121,9 @@ struct steamcompmgr_win_t {
 	// GAMESCOPE_BOTTOM_SCREEN: drawn on the leased panel (the AYN Thor's
 	// bottom screen), never on the main output or focused there.
 	bool isBottomScreen = false;
+	// An emulator's second-screen window, known by its title: drawn on the
+	// leased panel while that is free, otherwise left as any window.
+	bool isBottomScreenByTitle = false;
 	bool isExternalOverlay = false;
 	// mangoapp keeps the property but zeroes it while hidden.
 	bool bHasExternalOverlayProp = false;

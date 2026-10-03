@@ -1,7 +1,7 @@
 # gamescope for dual-screen handhelds
 
-**Work in progress. The bottom-screen drawing (the last commit) is untested on
-hardware.**
+**Work in progress. The bottom-screen drawing and the emulator window rules
+(the last two code commits) are untested on hardware.**
 
 This branch (`dual-screen`) teaches gamescope to use the second panel of a
 dual-screen handheld such as the AYN Thor. It is what [PB-OS](https://github.com/project-barry/pb-os)
@@ -45,11 +45,22 @@ first lease commit is the place to start. PB-OS builds this branch as is.
    ```
    xprop -id <window> -f GAMESCOPE_BOTTOM_SCREEN 32c -set GAMESCOPE_BOTTOM_SCREEN 1
    ```
+4. **Emulators' second windows, by title**: with no window carrying the
+   property, the bottom screen shows a window whose title matches
+   `GAMESCOPE_BOTTOM_SCREEN_TITLES` (a POSIX extended regex; empty matches
+   nothing). The default covers stock emulators set to one screen per window:
+   - melonDS 1.x with a second window open (*View → Open new window*, kept
+     across launches; *View → Screen sizing*: *Top only* in the first window,
+     *Bottom only* in the second): its extra windows are titled `[w2] ...`.
+   - Azahar with *View → Screen Layout → Separate Windows* (English UI):
+     `... | Secondary Window`.
+
+   Unlike the property, a window matched by title stays an ordinary window
+   while the panel cannot be taken (no leased panel, or a protocol client
+   holds it): gamescope then treats it as upstream does.
 
 ## Planned
 
-- Rules that send an emulator's second window (melonDS, Azahar) to the bottom
-  screen on their own, so stock emulators get two screens.
 - Touch on the bottom panel going to the window shown there.
 - Handing the panel back to the lease's holder on request (an overlay such as
   a performance dashboard) and taking it again after.
