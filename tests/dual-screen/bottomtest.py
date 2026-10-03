@@ -49,12 +49,19 @@ def pump(seconds):
             if ev.type == 35 and getattr(ev, "evtype", None) in XI_TOUCH:  # GenericEvent
                 TOUCH.append((XI_TOUCH[ev.evtype], getattr(ev.data.event, "id", ev.data.event),
                               ev.data.event_x, ev.data.event_y))
+            elif ev.type == X.ConfigureNotify:
+                for w in Win.alive + Win.all:
+                    if w.id == ev.window.id:
+                        w.configured(ev.width, ev.height)
 
 
 class Win:
     alive = []
+    all = []
 
-    def __init__(self, title, color, size=(640, 480), transient_for=None):
+    def __init__(self, title, color, size=(640, 480), transient_for=None, fixed=False):
+        """fixed: the app will not be resized (sizes itself back), as some
+        will not."""
         scr = d.screen()
         self.color = color
         self.w = root.create_window(0, 0, size[0], size[1], 0, scr.root_depth,
@@ -63,6 +70,8 @@ class Win:
         self.w.xinput_select_events([(xinput.AllMasterDevices, sum(1 << t for t in XI_TOUCH))])
         self.gc = self.w.create_gc(foreground=color)
         self.size = size
+        self.fixed = size if fixed else None
+        Win.all.append(self)
         if transient_for:
             self.w.set_wm_transient_for(transient_for.w)
         self.set_title(title)
@@ -71,6 +80,12 @@ class Win:
     @property
     def id(self):
         return self.w.id
+
+    def configured(self, width, height):
+        if self.fixed and (width, height) != self.fixed:
+            self.w.configure(width=self.fixed[0], height=self.fixed[1])
+            return
+        self.size = (width, height)
 
     def set_title(self, title):
         self.w.set_wm_name(title)
@@ -157,6 +172,7 @@ def scenario_melonds():
     second.set_title("[w2] [60/60] melonDS 1.0")
     pump(1.5)
     check(shown_last(m) == second.id, "melonDS: the [w2] window is shown on the bottom screen")
+    check(second.size == logical_size(), f"melonDS: it is sized to the turned panel (got {second.size})")
     check(focused() == main.id, "melonDS: focus stays on the main window (not the transient [w2])")
     # Titles change every second with the frame rate.
     for fps in range(55, 61):
@@ -255,16 +271,15 @@ def scenario_touch():
     main = Win("[60/60] melonDS 1.0", RED, (512, 384))
     main.map()
     pump(1.0)
-    size = (256, 192)
-    second = Win("[w2] [60/60] melonDS 1.0", BLUE, size, transient_for=main)
+    second = Win("[w2] [60/60] melonDS 1.0", BLUE, (256, 192), transient_for=main)
     second.map()
     pump(1.5)
 
-    # A tap and a drag on the window.
+    # A tap and a drag on the window (sized to the panel by now).
     n = len(TOUCH)
-    touch("down", 0, *panel_point(size, 64, 48))
+    touch("down", 0, *panel_point(second.size, 64, 48))
     pump(0.3)
-    touch("motion", 0, *panel_point(size, 200, 150))
+    touch("motion", 0, *panel_point(second.size, 200, 150))
     pump(0.3)
     touch("up", 0)
     pump(0.5)
@@ -282,8 +297,8 @@ def scenario_touch():
 
     # Two fingers at once each reach the window.
     n = len(TOUCH)
-    touch("down", 4, *panel_point(size, 30, 30))
-    touch("down", 5, *panel_point(size, 220, 160))
+    touch("down", 4, *panel_point(second.size, 30, 30))
+    touch("down", 5, *panel_point(second.size, 220, 160))
     pump(0.3)
     touch("up", 4)
     touch("up", 5)
@@ -291,17 +306,32 @@ def scenario_touch():
     got = [e for e in touch_events(n, second.id) if e[0] == "begin"]
     check(len(got) == 2, f"touch: two fingers are two touches (got {got})")
 
-    # The black bars above and below the window: nobody's.
+    # An app that keeps its own size gets black bars; touches there are
+    # nobody's, touches on it still land right.
+    second.unmap()
+    pump(1.0)
+    fixed = Win("[w2] [60/60] melonDS 1.0", GREEN, (256, 192), transient_for=main, fixed=True)
+    fixed.map()
+    pump(2.5)
     n = len(TOUCH)
     touch("down", 1, *panel_from_logical(0.5, 20 / logical_size()[1]))
     pump(0.2)
     touch("up", 1)
     pump(0.3)
-    check(not touch_events(n), f"touch: a tap on the black bars reaches no window (got {touch_events(n)})")
+    check(fixed.size == (256, 192) and not touch_events(n),
+          f"touch: a tap on the black bars reaches no window (size {fixed.size}, got {touch_events(n)})")
+    n = len(TOUCH)
+    touch("down", 6, *panel_point(fixed.size, 100, 80))
+    pump(0.3)
+    touch("up", 6)
+    pump(0.4)
+    begin = [e for e in touch_events(n, fixed.id) if e[0] == "begin"]
+    check(len(begin) == 1 and abs(begin[0][2] - 100) <= 1 and abs(begin[0][3] - 80) <= 1,
+          f"touch: and a tap on a window that keeps its size lands right (got {begin})")
 
     # Once the window closes the panel's touches go back to the lease's
     # holder (none here), not to the game.
-    second.unmap()
+    fixed.unmap()
     pump(1.0)
     n = len(TOUCH)
     touch("down", 2, 0.5, 0.5)
@@ -311,14 +341,14 @@ def scenario_touch():
     check(not touch_events(n), "touch: with no bottom window the panel's touches reach no window")
 
     # A finger kept down while the window closes.
-    second2 = Win("[w2] [60/60] melonDS 1.0", GREEN, size, transient_for=main)
+    second2 = Win("[w2] [60/60] melonDS 1.0", GREEN, (256, 192), transient_for=main)
     second2.map()
     pump(1.5)
-    touch("down", 3, *panel_point(size, 100, 100))
+    touch("down", 3, *panel_point(second2.size, 100, 100))
     pump(0.3)
     second2.unmap()
     pump(1.0)
-    touch("motion", 3, *panel_point(size, 120, 120))
+    touch("motion", 3, *panel_point(second2.size, 120, 120))
     touch("up", 3)
     pump(0.3)
     check("bottom-screen" in log_text() and focused() == main.id,
@@ -488,7 +518,8 @@ def scenario_png():
     main = Win("[60/60] melonDS 1.0", RED, (512, 384))
     main.map()
     pump(1.0)
-    second = Win("[w2] [60/60] melonDS 1.0", BLUE, (256, 192), transient_for=main)
+    # One that keeps its own size, to see it fitted with bars beside it.
+    second = Win("[w2] [60/60] melonDS 1.0", BLUE, (256, 192), transient_for=main, fixed=True)
     second.map()
     pump(3.0)
     path = os.environ.get("GAMESCOPE_BOTTOM_SCREEN_SIMULATE_PNG", "/nonexistent")
@@ -496,22 +527,30 @@ def scenario_png():
     if not os.path.exists(path):
         return
     # Under a headless gamescope, Xwayland's shm buffers now and then arrive
-    # empty (black), on the main output too; wait for a frame with content.
-    for _ in range(20):
-        img = read_png(path)
-        if pixel(img, 300, 900) != (0, 0, 0):
-            break
-        pump(0.5)
+    # empty (black), on the main output too, and gamescope asks the window
+    # to fill the panel once a second (it sizes itself back): wait for a
+    # frame of the window at its own size.
     # The panel is 1080x1240, turned one step back (rotation 3): the
     # 256x192 window fills its 1240x1080 logical space as 1240x930, i.e.
     # 930 wide and centred in the buffer, its top left at the buffer's top
     # right.
-    check(img[:2] == (1080, 1240), f"png: the frame is the panel's size (got {img[0]}x{img[1]})")
     blue = (0x30, 0x50, 0xD0)
-    check(near(pixel(img, 300, 900), blue), f"png: the window's colour is kept, not darkened (got {pixel(img, 300, 900)})")
-    check(near(pixel(img, 780, 300), (255, 255, 255)), "png: the window's top left lands at the buffer's top right")
-    check(near(pixel(img, 300, 300), blue) and near(pixel(img, 780, 900), blue), "png: the other quarters are the window's colour")
-    check(near(pixel(img, 30, 600), (0, 0, 0)) and near(pixel(img, 1050, 600), (0, 0, 0)), "png: black bars at the sides")
+    def frame_checks(img):
+        return [
+            (img[:2] == (1080, 1240), f"png: the frame is the panel's size (got {img[0]}x{img[1]})"),
+            (near(pixel(img, 300, 900), blue), f"png: the window's colour is kept, not darkened (got {pixel(img, 300, 900)})"),
+            (near(pixel(img, 780, 300), (255, 255, 255)), "png: the window's top left lands at the buffer's top right"),
+            (near(pixel(img, 300, 300), blue) and near(pixel(img, 780, 900), blue), "png: the other quarters are the window's colour"),
+            (near(pixel(img, 30, 600), (0, 0, 0)) and near(pixel(img, 1050, 600), (0, 0, 0)), "png: black bars at the sides"),
+        ]
+    results = []
+    for _ in range(20):
+        results = frame_checks(read_png(path))
+        if all(ok for ok, _ in results):
+            break
+        pump(0.5)
+    for ok, what in results:
+        check(ok, what)
 
 
 if __name__ == "__main__":

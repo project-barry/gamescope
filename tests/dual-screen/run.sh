@@ -29,7 +29,7 @@ for s in "${SCENARIOS[@]}"; do
   (
     [[ $s == disabled ]] && export GAMESCOPE_BOTTOM_SCREEN_TITLES=
     GS_LOG="$log" GAMESCOPE_BOTTOM_SCREEN_SIMULATE_PNG="$OUT/$s.png" \
-      timeout 120 "$BUILD/src/gamescope" --backend headless -W 1280 -H 800 --xwayland-count 1 -- \
+      timeout 120 "$BUILD/src/gamescope" --backend headless -W 1920 -H 1080 --xwayland-count 1 -- \
       python3 "$HERE/bottomtest.py" "$s" >"$log" 2>&1
     echo "gamescope exit: $?" >>"$log"
   )
