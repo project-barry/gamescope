@@ -10376,7 +10376,8 @@ namespace
 
 		steamcompmgr_win_t *FindWindow();
 		static bool Yielded();
-		void PublishShowing( bool bShowing );
+		enum class EShowing : uint32_t { Absent = 0, Shown = 1, Waiting = 2 };
+		void PublishShowing( EShowing eShowing );
 		void Release( bool bYield = false );
 		void PresentThread();
 		void SetTouchTarget( const BottomScreenTouchTarget *pTarget );
@@ -10390,7 +10391,7 @@ namespace
 		uint64_t m_ulLastPng = 0;
 		std::optional<BottomScreenTouchTarget> m_oTouchTarget;
 		bool m_bRaisedForTouch = false;
-		bool m_bPublishedShowing = false;
+		EShowing m_ePublishedShowing = EShowing::Absent;
 
 		static constexpr int k_nImages = 3;
 
@@ -10617,21 +10618,23 @@ namespace
 		return false;
 	}
 
-	// GAMESCOPE_BOTTOM_SCREEN_SHOWING on every Xwayland's root, 1 while the
-	// panel shows a window of ours rather than its lease's holder's: an
-	// on-screen keyboard there can tell whether it is seen.
-	void CBottomScreen::PublishShowing( bool bShowing )
+	// GAMESCOPE_BOTTOM_SCREEN_SHOWING on every Xwayland's root: 1 while the
+	// panel shows a window of ours rather than its lease's holder's (an
+	// on-screen keyboard there can tell whether it is seen), 2 while such a
+	// window waits for a yielded panel, absent otherwise.
+	void CBottomScreen::PublishShowing( EShowing eShowing )
 	{
-		if ( bShowing == m_bPublishedShowing )
+		if ( eShowing == m_ePublishedShowing )
 			return;
-		m_bPublishedShowing = bShowing;
+		m_ePublishedShowing = eShowing;
+		const bool bShowing = eShowing != EShowing::Absent;
 		gamescope_xwayland_server_t *server = nullptr;
 		for ( size_t i = 0; ( server = wlserver_get_xwayland_server( i ) ); i++ )
 		{
 			xwayland_ctx_t *ctx = server->ctx.get();
 			if ( bShowing )
 			{
-				uint32_t uValue = 1;
+				uint32_t uValue = (uint32_t)eShowing;
 				XChangeProperty( ctx->dpy, ctx->root, ctx->atoms.gamescopeBottomScreenShowing, XA_CARDINAL, 32,
 					PropModeReplace, (unsigned char *)&uValue, 1 );
 			}
@@ -10659,7 +10662,7 @@ namespace
 			MakeFocusDirty();
 		}
 		PanelRelease();
-		PublishShowing( false );
+		PublishShowing( bYield ? EShowing::Waiting : EShowing::Absent );
 		m_bHeld = false;
 		m_bYielded = bYield;
 		if ( !bYield )
@@ -10684,6 +10687,7 @@ namespace
 				m_bYielded = false;
 				m_pShown = nullptr;
 				MakeFocusDirty();
+				PublishShowing( EShowing::Absent );
 			}
 			return;
 		}
@@ -10702,6 +10706,7 @@ namespace
 				m_bYielded = true;
 				m_pShown = w;
 				MakeFocusDirty();
+				PublishShowing( EShowing::Waiting );
 			}
 			return;
 		}
@@ -10749,7 +10754,7 @@ namespace
 				w->isBottomScreen ? "property" : "title" );
 			// Leaves focus, or gets it back, from here on.
 			m_pShown = w;
-			PublishShowing( true );
+			PublishShowing( EShowing::Shown );
 			m_ulLastCommitID = 0;
 			MakeFocusDirty();
 

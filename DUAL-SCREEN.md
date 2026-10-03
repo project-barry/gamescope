@@ -87,12 +87,14 @@ first lease commit is the place to start. PB-OS builds this branch as is.
    xprop -root -remove GAMESCOPE_BOTTOM_SCREEN_YIELD
    ```
 
-   gamescope sets **`GAMESCOPE_BOTTOM_SCREEN_SHOWING`** (root, 32-bit, 1)
+   gamescope sets **`GAMESCOPE_BOTTOM_SCREEN_SHOWING`** (root, 32-bit) to 1
    while the panel shows one of its windows rather than the lease's
-   holder's, and removes it otherwise, so a program there (an on-screen
-   keyboard) can tell whether it is seen. PB-OS yields while Barry
-   Launcher's keyboard is open, and falls back to Steam's keyboard on the
-   main screen when the property stays set.
+   holder's, to 2 while such a window waits for a yielded panel, and
+   removes it otherwise. A program on the lease's holder can tell whether
+   it is seen (1), and whether a game waits for the panel (2). PB-OS yields
+   while Barry Launcher's dashboard or keyboard is open, or its home after
+   a long press of the AYN button (until the next one), and falls back to
+   Steam's keyboard on the main screen when the property stays 1.
 
 ## Testing without the panel
 
