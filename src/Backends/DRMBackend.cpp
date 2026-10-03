@@ -2595,7 +2595,14 @@ void finish_drm(struct drm_t *drm)
 		g_page_flip_pipe_fds[0] = -1;
 	}
 
+	// The session's logind D-Bus connection is the wlserver thread's: with
+	// it unlocked, that thread's event loop could read logind's reply to
+	// releasing the device first, and the call waited 25 s for it, past
+	// systemd's 10 s stop timeout (gamescope killed on most Game Mode
+	// stops).
+	wlserver_lock();
 	wlsession_close_kms();
+	wlserver_unlock( false );
 	g_DRM.fd = -1;
 }
 
