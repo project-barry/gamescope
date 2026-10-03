@@ -466,6 +466,217 @@ static void wlserver_touch_associate_connector(struct wlserver_touch *touch)
 	}
 }
 
+// The bottom screen's touches (--ignore-touch-device's device) go to the
+// window it shows while there is one, else to the lease's holder. A touch
+// that went down on the window keeps going there until it is lifted; its id
+// is moved past other touchscreens' so the seat can tell them apart.
+//
+// X hands a touch to the topmost window at its point, and the window the
+// bottom screen shows sits under the game. So a new touch waits here until
+// steamcompmgr has raised the window (CBottomScreen), which then delivers
+// it: wlserver_bottom_screen_touch_flush. The rest of a touch follows its
+// start, wherever the window is stacked by then.
+static constexpr int k_nBottomScreenTouchIdBase = 0x10000;
+
+struct BottomScreenTouchEvent
+{
+	DrmLeaseEventType eType;
+	double x, y;
+	int nId;
+	uint32_t uTime;
+};
+
+static struct
+{
+	std::optional<BottomScreenTouchTarget> oTarget;
+	struct wl_listener surfaceDestroy;
+	std::set<int> downIds; // the device's ids, delivered
+	std::set<int> pendingIds; // went down, not delivered yet
+	std::vector<BottomScreenTouchEvent> pending;
+} s_BottomScreenTouch;
+
+static void bottom_screen_touch_lift_all( uint32_t uTime )
+{
+	auto &state = s_BottomScreenTouch;
+	state.pending.clear();
+	state.pendingIds.clear();
+	if ( state.downIds.empty() )
+		return;
+	for ( int nId : state.downIds )
+		wlr_seat_touch_notify_up( wlserver.wlr.seat, uTime, k_nBottomScreenTouchIdBase + nId );
+	wlr_seat_touch_notify_frame( wlserver.wlr.seat );
+	state.downIds.clear();
+}
+
+static void bottom_screen_touch_handle_surface_destroy( struct wl_listener *listener, void *data )
+{
+	// wlroots ends the surface's touch points itself.
+	auto &state = s_BottomScreenTouch;
+	state.downIds.clear();
+	state.pendingIds.clear();
+	state.pending.clear();
+	wl_list_remove( &state.surfaceDestroy.link );
+	state.oTarget.reset();
+}
+
+void wlserver_set_bottom_screen_touch_target( const BottomScreenTouchTarget *pTarget )
+{
+	assert( wlserver_is_lock_held() );
+
+	auto &state = s_BottomScreenTouch;
+	const bool bSameSurface = pTarget && state.oTarget && state.oTarget->pSurface == pTarget->pSurface;
+	if ( state.oTarget && !bSameSurface )
+	{
+		bottom_screen_touch_lift_all( get_time_in_milliseconds() );
+		wl_list_remove( &state.surfaceDestroy.link );
+		state.oTarget.reset();
+	}
+
+	if ( !pTarget || !pTarget->pSurface || !pTarget->flScale )
+		return;
+	if ( !bSameSurface )
+	{
+		state.surfaceDestroy.notify = bottom_screen_touch_handle_surface_destroy;
+		wl_signal_add( &pTarget->pSurface->events.destroy, &state.surfaceDestroy );
+	}
+	state.oTarget = *pTarget;
+}
+
+// A point of the panel (normalized, as it scans out) in the window's
+// surface coordinates, undoing the bottom screen's turn as
+// apply_touchscreen_orientation does the main output's; false when it is
+// beside the window.
+static bool bottom_screen_touch_point( double x, double y, double *pSX, double *pSY )
+{
+	const BottomScreenTouchTarget &target = *s_BottomScreenTouch.oTarget;
+	double flX, flY;
+	switch ( target.uRotation & 3u )
+	{
+		case 1: flX = 1.0 - y; flY = x; break;
+		case 2: flX = 1.0 - x; flY = 1.0 - y; break;
+		case 3: flX = y; flY = 1.0 - x; break;
+		default: flX = x; flY = y; break;
+	}
+	*pSX = ( flX * target.flLogicalWidth - target.flOffsetX ) / target.flScale;
+	*pSY = ( flY * target.flLogicalHeight - target.flOffsetY ) / target.flScale;
+	return *pSX >= 0.0 && *pSY >= 0.0 && *pSX < target.uWidth && *pSY < target.uHeight;
+}
+
+static void bottom_screen_touch_deliver( const BottomScreenTouchEvent &event )
+{
+	auto &state = s_BottomScreenTouch;
+	struct wlr_seat *pSeat = wlserver.wlr.seat;
+	const int nSeatId = k_nBottomScreenTouchIdBase + event.nId;
+	double flSX, flSY;
+
+	switch ( event.eType )
+	{
+		case DrmLeaseEventType::Down:
+			state.pendingIds.erase( event.nId );
+			if ( !state.oTarget || !bottom_screen_touch_point( event.x, event.y, &flSX, &flSY ) )
+				return;
+			wlr_seat_touch_notify_down( pSeat, state.oTarget->pSurface, event.uTime, nSeatId, flSX, flSY );
+			state.downIds.insert( event.nId );
+			break;
+		case DrmLeaseEventType::Motion:
+			if ( !state.downIds.count( event.nId ) )
+				return;
+			bottom_screen_touch_point( event.x, event.y, &flSX, &flSY );
+			flSX = std::clamp( flSX, 0.0, state.oTarget->uWidth - 0.1 );
+			flSY = std::clamp( flSY, 0.0, state.oTarget->uHeight - 0.1 );
+			wlr_seat_touch_notify_motion( pSeat, event.uTime, nSeatId, flSX, flSY );
+			break;
+		case DrmLeaseEventType::Up:
+			if ( !state.downIds.erase( event.nId ) )
+				return;
+			wlr_seat_touch_notify_up( pSeat, event.uTime, nSeatId );
+			break;
+		default:
+			return;
+	}
+	wlr_seat_touch_notify_frame( pSeat );
+	bump_input_counter();
+}
+
+bool wlserver_bottom_screen_touch_waiting()
+{
+	assert( wlserver_is_lock_held() );
+	return !s_BottomScreenTouch.pendingIds.empty();
+}
+
+bool wlserver_bottom_screen_touch_flush()
+{
+	assert( wlserver_is_lock_held() );
+	auto &state = s_BottomScreenTouch;
+	std::vector<BottomScreenTouchEvent> events = std::move( state.pending );
+	state.pending.clear();
+	for ( const BottomScreenTouchEvent &event : events )
+		bottom_screen_touch_deliver( event );
+	return !state.downIds.empty() || !state.pendingIds.empty();
+}
+
+// False when the touch isn't the bottom screen window's, for the lease's
+// holder then.
+static bool bottom_screen_touch( DrmLeaseEventType eType, double x, double y, int nId, uint32_t uTime )
+{
+	auto &state = s_BottomScreenTouch;
+	const BottomScreenTouchEvent event = { eType, x, y, nId, uTime };
+
+	if ( eType == DrmLeaseEventType::Down )
+	{
+		if ( !state.oTarget )
+			return false;
+		double flSX, flSY;
+		// Beside the window (the black bars): nobody's.
+		if ( state.downIds.count( nId ) || state.pendingIds.count( nId ) ||
+			 !bottom_screen_touch_point( x, y, &flSX, &flSY ) )
+			return true;
+		state.pending.push_back( event );
+		state.pendingIds.insert( nId );
+		nudge_steamcompmgr();
+		return true;
+	}
+
+	if ( state.pendingIds.count( nId ) )
+	{
+		state.pending.push_back( event );
+		return true;
+	}
+	if ( !state.downIds.count( nId ) )
+		return false;
+	bottom_screen_touch_deliver( event );
+	return true;
+}
+
+static void bottom_screen_or_lease_touch( DrmLeaseEventType eType, double x, double y, int nId, uint32_t uTime )
+{
+	if ( !bottom_screen_touch( eType, x, y, nId, uTime ) )
+		drm_lease_send_touch( eType, x, y, nId, uTime );
+}
+
+// For testing without the panel's touchscreen: "down|motion|up ID X Y", a
+// touch of it as libinput reports one (X, Y normalized as the panel scans
+// out), e.g. gamescopectl bottom_screen_touch "down 0 0.5 0.5".
+static gamescope::ConCommand cc_bottom_screen_touch( "bottom_screen_touch",
+	"Feed the bottom screen's touch input: \"down|motion|up ID X Y\" (X, Y normalized, as the panel scans out)",
+[]( std::span<std::string_view> args )
+{
+	if ( args.size() < 2 || !wlserver_is_lock_held() )
+		return;
+	const std::string sArgs{ args[1] };
+	char szType[8] = {};
+	int nId = 0;
+	double x = 0.0, y = 0.0;
+	if ( sscanf( sArgs.c_str(), "%7s %d %lf %lf", szType, &nId, &x, &y ) < 2 )
+		return;
+	DrmLeaseEventType eType;
+	if ( !strcmp( szType, "down" ) ) eType = DrmLeaseEventType::Down;
+	else if ( !strcmp( szType, "motion" ) ) eType = DrmLeaseEventType::Motion;
+	else if ( !strcmp( szType, "up" ) ) eType = DrmLeaseEventType::Up;
+	else return;
+	bottom_screen_or_lease_touch( eType, x, y, nId, get_time_in_milliseconds() );
+});
+
 static void wlserver_handle_touch_down(struct wl_listener *listener, void *data)
 {
 	struct wlserver_touch *touch = wl_container_of( listener, touch, down );
@@ -473,7 +684,7 @@ static void wlserver_handle_touch_down(struct wl_listener *listener, void *data)
 
 	if ( touch->bIgnoreWhileLeased )
 	{
-		drm_lease_send_touch( DrmLeaseEventType::Down, event->x, event->y, event->touch_id, event->time_msec );
+		bottom_screen_or_lease_touch( DrmLeaseEventType::Down, event->x, event->y, event->touch_id, event->time_msec );
 		return;
 	}
 
@@ -488,7 +699,7 @@ static void wlserver_handle_touch_up(struct wl_listener *listener, void *data)
 
 	if ( touch->bIgnoreWhileLeased )
 	{
-		drm_lease_send_touch( DrmLeaseEventType::Up, 0.0, 0.0, event->touch_id, event->time_msec );
+		bottom_screen_or_lease_touch( DrmLeaseEventType::Up, 0.0, 0.0, event->touch_id, event->time_msec );
 		return;
 	}
 
@@ -502,7 +713,7 @@ static void wlserver_handle_touch_motion(struct wl_listener *listener, void *dat
 
 	if ( touch->bIgnoreWhileLeased )
 	{
-		drm_lease_send_touch( DrmLeaseEventType::Motion, event->x, event->y, event->touch_id, event->time_msec );
+		bottom_screen_or_lease_touch( DrmLeaseEventType::Motion, event->x, event->y, event->touch_id, event->time_msec );
 		return;
 	}
 

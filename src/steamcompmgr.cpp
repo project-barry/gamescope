@@ -10369,6 +10369,8 @@ namespace
 		steamcompmgr_win_t *FindWindow();
 		void Release();
 		void PresentThread();
+		void SetTouchTarget( const BottomScreenTouchTarget *pTarget );
+		void HandleTouches( steamcompmgr_win_t *w );
 		bool PanelAcquire( BottomScreenInfo *pInfo );
 		bool PanelPresent( const BottomScreenJob &job );
 		void PanelRelease();
@@ -10376,6 +10378,8 @@ namespace
 
 		const std::optional<Simulated> m_oSimulated = ParseSimulated();
 		uint64_t m_ulLastPng = 0;
+		std::optional<BottomScreenTouchTarget> m_oTouchTarget;
+		bool m_bRaisedForTouch = false;
 
 		static constexpr int k_nImages = 3;
 
@@ -10488,6 +10492,58 @@ namespace
 			rename( sTemp.c_str(), m_oSimulated->sPng.c_str() );
 	}
 
+	// Where the panel's touches go (wlserver), set when it changes.
+	void CBottomScreen::SetTouchTarget( const BottomScreenTouchTarget *pTarget )
+	{
+		if ( !pTarget && !m_oTouchTarget )
+			return;
+		if ( pTarget && m_oTouchTarget )
+		{
+			const BottomScreenTouchTarget &old = *m_oTouchTarget;
+			if ( pTarget->pSurface == old.pSurface && pTarget->uWidth == old.uWidth && pTarget->uHeight == old.uHeight &&
+				 pTarget->uRotation == old.uRotation && pTarget->flLogicalWidth == old.flLogicalWidth &&
+				 pTarget->flLogicalHeight == old.flLogicalHeight && pTarget->flOffsetX == old.flOffsetX &&
+				 pTarget->flOffsetY == old.flOffsetY && pTarget->flScale == old.flScale )
+				return;
+		}
+		wlserver_lock();
+		wlserver_set_bottom_screen_touch_target( pTarget );
+		wlserver_unlock();
+		if ( pTarget )
+			m_oTouchTarget = *pTarget;
+		else
+			m_oTouchTarget.reset();
+	}
+
+	// X hands a touch to the topmost window at its point and the shown
+	// window sits under the game, so a new touch waits (wlserver) while the
+	// window is raised; once no touch is down the focus pass raises the game
+	// again. A touch keeps going where it started.
+	void CBottomScreen::HandleTouches( steamcompmgr_win_t *w )
+	{
+		if ( !m_oTouchTarget )
+			return;
+		wlserver_lock();
+		const bool bWaiting = wlserver_bottom_screen_touch_waiting();
+		wlserver_unlock();
+		if ( !bWaiting && !m_bRaisedForTouch )
+			return;
+		if ( bWaiting )
+		{
+			w->Raise();
+			XSync( w->xwayland().ctx->dpy, False );
+			m_bRaisedForTouch = true;
+		}
+		wlserver_lock();
+		const bool bDown = wlserver_bottom_screen_touch_flush();
+		wlserver_unlock();
+		if ( !bDown )
+		{
+			m_bRaisedForTouch = false;
+			MakeFocusDirty();
+		}
+	}
+
 	steamcompmgr_win_t *CBottomScreen::FindWindow()
 	{
 		// The property first, then titles.
@@ -10541,6 +10597,12 @@ namespace
 			std::unique_lock lock( m_Mutex );
 			m_Cv.wait( lock, [&] { return !m_bBusy; } );
 			m_nOnScreen = -1;
+		}
+		SetTouchTarget( nullptr );
+		if ( m_bRaisedForTouch )
+		{
+			m_bRaisedForTouch = false;
+			MakeFocusDirty();
 		}
 		PanelRelease();
 		m_bHeld = false;
@@ -10605,7 +10667,16 @@ namespace
 			m_pShown = w;
 			m_ulLastCommitID = 0;
 			MakeFocusDirty();
+
+			// X drops touches outside its screen, and the emulator may have
+			// put the window anywhere.
+			const auto &attr = w->xwayland().a;
+			const xwayland_ctx_t *ctx = w->xwayland().ctx;
+			if ( attr.x < 0 || attr.y < 0 || attr.x + attr.width > ctx->root_width || attr.y + attr.height > ctx->root_height )
+				XMoveWindow( ctx->dpy, w->xwayland().id, 0, 0 );
 		}
+
+		HandleTouches( w );
 
 		commit_t *pCommit = get_window_last_done_commit_peek( w );
 		if ( !pCommit || pCommit->commitID == m_ulLastCommitID )
@@ -10648,6 +10719,19 @@ namespace
 		layer->applyColorMgmt = false;
 		layer->colorspace = pCommit->colorspace();
 		layer->eAlphaBlendingMode = ALPHA_BLENDING_MODE_PREMULTIPLIED;
+
+		// The panel's touches go to the window where it is drawn.
+		BottomScreenTouchTarget touchTarget = {};
+		touchTarget.pSurface = w->main_surface();
+		touchTarget.uWidth = pTex->width();
+		touchTarget.uHeight = pTex->height();
+		touchTarget.uRotation = m_Info.uRotation;
+		touchTarget.flLogicalWidth = flLogicalWidth;
+		touchTarget.flLogicalHeight = flLogicalHeight;
+		touchTarget.flOffsetX = -layer->offset.x;
+		touchTarget.flOffsetY = -layer->offset.y;
+		touchTarget.flScale = flRatio;
+		SetTouchTarget( touchTarget.pSurface ? &touchTarget : nullptr );
 
 		std::optional<uint64_t> oSeqNo = vulkan_composite_bottom_screen( &frameInfo, m_pImages[ nImage ], m_Info.uRotation );
 		if ( !oSeqNo )

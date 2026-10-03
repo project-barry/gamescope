@@ -287,6 +287,27 @@ void wlserver_touchmotion( double x, double y, int touch_id, uint32_t time, bool
 void wlserver_touchdown( double x, double y, int touch_id, uint32_t time, gamescope::IBackendConnector* connector = nullptr );
 void wlserver_touchup( int touch_id, uint32_t time );
 
+// Where the bottom screen (steamcompmgr's CBottomScreen) shows a window,
+// for the touches of --ignore-touch-device's device: while one is set they
+// go to that window instead of the lease's holder.
+struct BottomScreenTouchTarget
+{
+	struct wlr_surface *pSurface;
+	uint32_t uWidth, uHeight; // the window, in surface coordinates
+	uint32_t uRotation; // the panel's turn, 0-3 steps as g_uOutputRotation
+	double flLogicalWidth, flLogicalHeight; // the turned panel
+	double flOffsetX, flOffsetY; // the window's top left on it
+	double flScale; // panel pixels per window pixel
+};
+// Caller holds the wlserver lock; nullptr: no window, touches go back to
+// the lease's holder.
+void wlserver_set_bottom_screen_touch_target( const BottomScreenTouchTarget *pTarget );
+// A new touch of the window waits for steamcompmgr to raise the window,
+// X routing touches by stacking. Caller holds the wlserver lock.
+bool wlserver_bottom_screen_touch_waiting();
+// Delivers the waiting touches; true while any touch of the window is down.
+bool wlserver_bottom_screen_touch_flush();
+
 void wlserver_send_frame_done( struct wlr_surface *surf, const struct timespec *when );
 
 bool wlserver_surface_is_async( struct wlr_surface *surf );

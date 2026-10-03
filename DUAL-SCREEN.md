@@ -1,7 +1,8 @@
 # gamescope for dual-screen handhelds
 
-**Work in progress. The bottom-screen drawing and the emulator window rules
-(the last two code commits) are untested on hardware.**
+**Work in progress. The bottom-screen drawing, the emulator window rules and
+touch on the bottom screen are untested on hardware** (tested headless, see
+below).
 
 This branch (`dual-screen`) teaches gamescope to use the second panel of a
 dual-screen handheld such as the AYN Thor. It is what [PB-OS](https://github.com/project-barry/pb-os)
@@ -60,6 +61,20 @@ first lease commit is the place to start. PB-OS builds this branch as is.
    Unlike the property, a window matched by title stays an ordinary window
    while the panel cannot be taken (no leased panel, or a protocol client
    holds it): gamescope then treats it as upstream does.
+5. **Touch on the bottom screen**: while the bottom screen shows a window,
+   the touches of `--ignore-touch-device`'s touchscreen go to that window,
+   mapped through the panel's turn and the fit, instead of the lease's
+   holder. They arrive as touches (XI 2.2 touch events for X11 apps;
+   gamescope starts Xwayland with `-noTouchPointerEmulation`), as Qt apps
+   such as melonDS and Azahar take them. X hands a touch to the topmost
+   window at its point, so the window is raised under the game while a
+   touch starts and the game is raised again once no touch is down.
+   Touches on the black bars beside the window go nowhere.
+   `gamescopectl bottom_screen_touch "down|motion|up ID X Y"` feeds such a
+   touch by hand (X, Y normalized as the panel scans out).
+
+   Not yet known: whether Cemu's GamePad view, which reads mouse clicks,
+   takes these touches (through GTK).
 
 ## Testing without the panel
 
@@ -68,12 +83,12 @@ steps of 90°, 0-3, as the main output's) stands in for the leased panel on any
 backend, headless included: windows are picked, focus is kept and frames
 are drawn exactly as for the real panel, only not scanned out. With
 `GAMESCOPE_BOTTOM_SCREEN_SIMULATE_PNG=<path>` the newest frame is saved
-there twice a second. `tests/dual-screen/` uses it to check the window
-rules, focus and drawing under a headless gamescope.
+there twice a second. `tests/dual-screen/` uses it, with
+`bottom_screen_touch`, to check the window rules, focus, drawing and touch
+under a headless gamescope.
 
 ## Planned
 
-- Touch on the bottom panel going to the window shown there.
 - Handing the panel back to the lease's holder on request (an overlay such as
   a performance dashboard) and taking it again after.
 
