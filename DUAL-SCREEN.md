@@ -53,7 +53,8 @@ first lease commit is the place to start. PB-OS builds this branch as is.
      across launches; *View → Screen sizing*: *Top only* in the first window,
      *Bottom only* in the second): its extra windows are titled `[w2] ...`.
    - Azahar with *View → Screen Layout → Separate Windows* (English UI):
-     `... | Secondary Window`. Azahar replaces Citra and Lime3DS.
+     `... | Secondary Window`. Lime3DS and Citra, which Azahar replaces,
+     title it the same way.
    - Cemu with *Options → Separate GamePad view* (English UI): `GamePad
      View`, the Wii U GamePad's screen.
 
