@@ -325,6 +325,69 @@ def scenario_touch():
           "touch: a window closing under a finger leaves gamescope running, focus on the game")
 
 
+def set_yield(on):
+    atom = d.intern_atom("GAMESCOPE_BOTTOM_SCREEN_YIELD")
+    if on:
+        root.change_property(atom, Xatom.CARDINAL, 32, [1])
+    else:
+        root.delete_property(atom)
+    d.flush()
+
+
+def scenario_yield():
+    # An overlay of the lease's holder (Barry Launcher's AYN dashboard) asks
+    # for the panel with GAMESCOPE_BOTTOM_SCREEN_YIELD on the root.
+    main = Win("[60/60] melonDS 1.0", RED, (512, 384))
+    main.map()
+    pump(1.0)
+    size = (256, 192)
+    second = Win("[w2] [60/60] melonDS 1.0", BLUE, size, transient_for=main)
+    second.map()
+    pump(1.5)
+
+    m = mark()
+    set_yield(True)
+    pump(1.0)
+    check(gave_back(m) and "yielding the panel" in log_text()[m:], "yield: the panel goes back to the lease's holder")
+    check(focused() == main.id, "yield: the game keeps focus, the waiting window does not take it")
+    n = len(TOUCH)
+    touch("down", 0, *panel_point(size, 64, 48))
+    pump(0.3)
+    touch("up", 0)
+    pump(0.3)
+    check(not touch_events(n), "yield: the panel's touches go to the lease's holder, not the window")
+
+    m = mark()
+    set_yield(False)
+    pump(1.5)
+    check("took the simulated panel" in log_text()[m:] and shown_last(m) == second.id,
+          "yield: cleared, the panel is taken again for the window")
+    n = len(TOUCH)
+    touch("down", 1, *panel_point(size, 64, 48))
+    pump(0.3)
+    touch("up", 1)
+    pump(0.4)
+    check(any(e[0] == "begin" for e in touch_events(n, second.id)), "yield: touches reach the window again")
+    check(focused() == main.id, "yield: the game has focus throughout")
+
+    # A window that comes while the panel is yielded waits for it.
+    second.unmap()
+    pump(1.0)
+    set_yield(True)
+    pump(0.5)
+    m = mark()
+    third = Win("[w2] [60/60] melonDS 1.0", GREEN, size, transient_for=main)
+    third.map()
+    pump(1.5)
+    check(shown_last(m) is None and "took the simulated panel" not in log_text()[m:],
+          "yield: a window opened meanwhile is not shown")
+    check(focused() == main.id, "yield: nor does it take focus")
+    m = mark()
+    set_yield(False)
+    pump(1.5)
+    check(shown_last(m) == third.id, "yield: it is shown once the panel is free again")
+
+
 def scenario_disabled():
     # Run with GAMESCOPE_BOTTOM_SCREEN_TITLES set empty.
     main = Win("[60/60] melonDS 1.0", RED, (512, 384))

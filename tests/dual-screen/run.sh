@@ -14,7 +14,7 @@ BUILD="$(cd "${1:-build}" && pwd)"; shift || true
 OUT="${OUT:-$(mktemp -d)}"
 mkdir -p "$OUT"
 SCENARIOS=("$@")
-(( ${#SCENARIOS[@]} )) || SCENARIOS=(melonds azahar cemu property_wins disabled stress png touch)
+(( ${#SCENARIOS[@]} )) || SCENARIOS=(melonds azahar cemu property_wins disabled stress png touch yield)
 
 # gamescope starts its child through gamescopereaper, found on PATH.
 export PATH="$BUILD/src:$PATH"
