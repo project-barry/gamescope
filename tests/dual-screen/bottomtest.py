@@ -334,6 +334,11 @@ def set_yield(on):
     d.flush()
 
 
+def showing():
+    p = root.get_full_property(d.intern_atom("GAMESCOPE_BOTTOM_SCREEN_SHOWING"), X.AnyPropertyType)
+    return bool(p and len(p.value) and p.value[0])
+
+
 def scenario_yield():
     # An overlay of the lease's holder (Barry Launcher's AYN dashboard) asks
     # for the panel with GAMESCOPE_BOTTOM_SCREEN_YIELD on the root.
@@ -345,10 +350,12 @@ def scenario_yield():
     second.map()
     pump(1.5)
 
+    check(showing(), "yield: GAMESCOPE_BOTTOM_SCREEN_SHOWING is set while the window is shown")
     m = mark()
     set_yield(True)
     pump(1.0)
     check(gave_back(m) and "yielding the panel" in log_text()[m:], "yield: the panel goes back to the lease's holder")
+    check(not showing(), "yield: GAMESCOPE_BOTTOM_SCREEN_SHOWING is gone meanwhile")
     check(focused() == main.id, "yield: the game keeps focus, the waiting window does not take it")
     n = len(TOUCH)
     touch("down", 0, *panel_point(size, 64, 48))
@@ -368,6 +375,7 @@ def scenario_yield():
     touch("up", 1)
     pump(0.4)
     check(any(e[0] == "begin" for e in touch_events(n, second.id)), "yield: touches reach the window again")
+    check(showing(), "yield: GAMESCOPE_BOTTOM_SCREEN_SHOWING is back")
     check(focused() == main.id, "yield: the game has focus throughout")
 
     # A window that comes while the panel is yielded waits for it.
