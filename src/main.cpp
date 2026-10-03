@@ -102,6 +102,7 @@ const struct option *gamescope_options = (struct option[]){
 	{ "framerate-limit", required_argument, nullptr, 0 },
 	{ "lease-connector", required_argument, nullptr, 0 },
 	{ "drm-lease-client", required_argument, nullptr, 0 },
+	{ "drm-lease-yield", no_argument, nullptr, 0 },
 	{ "ignore-touch-device", required_argument, nullptr, 0 },
 
 	// openvr options
@@ -218,6 +219,7 @@ const char usage[] =
 	"  --cursor-scale-height          if specified, sets a base output height to linearly scale the cursor against.\n"
 	"  --lease-connector              if specified, marks a display connector for DRM leasing.\n"
 	"  --drm-lease-client             use a DRM lease from the given socket.\n"
+	"  --drm-lease-yield              give the lease up to drm-lease-v1 clients while they run.\n"
 	"  --ignore-touch-device          if specified, disables touch input for a given display.\n"
 	"  --virtual-connector-strategy   Specifies how we should make virtual connectors.\n"
 	"  --hdr-enabled                  enable HDR output (needs Gamescope WSI layer enabled for support from clients)\n"
@@ -717,6 +719,7 @@ bool g_bExposeWayland = false;
 const char *g_sOutputName = nullptr;
 const char *g_sLeaseConnectorName = nullptr;
 const char *g_sDrmLeaseClientSocket = nullptr;
+bool g_bDrmLeaseYield = false;
 const char *g_sIgnoreTouchDevice = nullptr;
 std::atomic<int> g_nActiveLeaseClients = { 0 };
 std::atomic<int> g_nProtocolLeaseHolders = { 0 };
@@ -878,6 +881,8 @@ int main(int argc, char **argv)
 					g_sLeaseConnectorName = optarg;
 				} else if (strcmp(opt_name, "drm-lease-client") == 0) {
 					g_sDrmLeaseClientSocket = optarg;
+				} else if (strcmp(opt_name, "drm-lease-yield") == 0) {
+					g_bDrmLeaseYield = true;
 				} else if (strcmp(opt_name, "ignore-touch-device") == 0) {
 					g_sIgnoreTouchDevice = optarg;
 				} else if (strcmp(opt_name, "virtual-connector-strategy") == 0) {
