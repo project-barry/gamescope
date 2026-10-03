@@ -6047,9 +6047,10 @@ get_size_hints(xwayland_ctx_t *ctx, steamcompmgr_win_t *w)
 }
 
 // Emulators' second-screen windows, which the bottom screen shows by
-// themselves: melonDS's extra windows ("[w2] [60/60] melonDS 1.0") and
+// themselves: melonDS's extra windows ("[w2] [60/60] melonDS 1.0"),
 // Azahar's Separate Windows layout ("Azahar 2125 | Game | Secondary
-// Window", English UI). GAMESCOPE_BOTTOM_SCREEN_TITLES, a POSIX extended
+// Window") and Cemu's separate GamePad view ("GamePad View - FPS: 59.94");
+// the last two in an English UI. GAMESCOPE_BOTTOM_SCREEN_TITLES, a POSIX extended
 // regex, replaces these; set empty, no window is matched.
 static bool bottom_screen_title_match( const std::string &sTitle )
 {
@@ -6058,7 +6059,7 @@ static bool bottom_screen_title_match( const std::string &sTitle )
 	{
 		const char *pszTitles = getenv( "GAMESCOPE_BOTTOM_SCREEN_TITLES" );
 		if ( !pszTitles )
-			pszTitles = "^\\[(p[0-9]+:)?w([2-9]|[1-9][0-9])] .*melonDS|^Azahar .* [|] Secondary Window$";
+			pszTitles = "^\\[(p[0-9]+:)?w([2-9]|[1-9][0-9])] .*melonDS|^Azahar .* [|] Secondary Window$|^GamePad View( - FPS: .*)?$";
 		if ( !pszTitles[0] )
 			return false;
 		if ( regcomp( &s_Regex, pszTitles, REG_EXTENDED | REG_NOSUB ) != 0 )
