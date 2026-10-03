@@ -8,8 +8,9 @@ screen shows and which one has focus.
 
 Usage: bottomtest.py <scenario>
 """
-import os, re, sys, time
+import os, re, subprocess, sys, time
 from Xlib import X, Xatom, display
+from Xlib.ext import xinput
 
 LOG = os.environ["GS_LOG"]
 d = display.Display()
@@ -19,6 +20,15 @@ BOTTOM = d.intern_atom("GAMESCOPE_BOTTOM_SCREEN")
 NET_WM_NAME = d.intern_atom("_NET_WM_NAME")
 UTF8 = d.intern_atom("UTF8_STRING")
 failures = []
+# (event, window id, x, y) of the touch events our windows got, as a Qt app
+# gets them: gamescope starts Xwayland with -noTouchPointerEmulation, so
+# touches stay touches.
+TOUCH = []
+XI_TOUCH = {18: "begin", 19: "update", 20: "end"}
+XI_OPCODE = d.display.get_extension_major(xinput.extname)
+xinput.XIQueryVersion(display=d.display, opcode=XI_OPCODE, major_version=2, minor_version=2)
+for _evtype in XI_TOUCH:
+    d.ge_add_event_data(XI_OPCODE, _evtype, xinput.DeviceEventData)
 
 
 def log_text():
@@ -35,7 +45,10 @@ def pump(seconds):
         d.flush()
         time.sleep(0.05)
         while d.pending_events():
-            d.next_event()
+            ev = d.next_event()
+            if ev.type == 35 and getattr(ev, "evtype", None) in XI_TOUCH:  # GenericEvent
+                TOUCH.append((XI_TOUCH[ev.evtype], getattr(ev.data.event, "id", ev.data.event),
+                              ev.data.event_x, ev.data.event_y))
 
 
 class Win:
@@ -47,6 +60,7 @@ class Win:
         self.w = root.create_window(0, 0, size[0], size[1], 0, scr.root_depth,
                                     background_pixel=0,
                                     event_mask=X.ExposureMask | X.StructureNotifyMask)
+        self.w.xinput_select_events([(xinput.AllMasterDevices, sum(1 << t for t in XI_TOUCH))])
         self.gc = self.w.create_gc(foreground=color)
         self.size = size
         if transient_for:
@@ -203,6 +217,112 @@ def scenario_property_wins():
     pump(1.5)
     check(shown_last(m) == second.id, "property: the title match is shown again when it closes")
     check(focused() == main.id, "property: focus stays on the main window throughout")
+
+
+# The simulated panel (run.sh): 1080x1240, turned one step back.
+PANEL_W, PANEL_H, PANEL_ROTATION = 1080, 1240, 3
+
+
+def logical_size():
+    return (PANEL_H, PANEL_W) if PANEL_ROTATION & 1 else (PANEL_W, PANEL_H)
+
+
+def panel_from_logical(lx, ly):
+    """A point of the turned panel (normalized) as its touchscreen reports
+    it, normalized as the panel scans out (rotateOutputCoord's turn)."""
+    return {0: (lx, ly), 1: (ly, 1 - lx), 2: (1 - lx, 1 - ly), 3: (1 - ly, lx)}[PANEL_ROTATION]
+
+
+def panel_point(win_size, sx, sy):
+    """The panel touch that lands on the window's (sx, sy): the window is
+    fitted into the turned panel, centred."""
+    lw, lh = logical_size()
+    scale = min(lw / win_size[0], lh / win_size[1])
+    return panel_from_logical(((lw - win_size[0] * scale) / 2 + sx * scale) / lw,
+                              ((lh - win_size[1] * scale) / 2 + sy * scale) / lh)
+
+
+def touch(kind, tid, x=0.0, y=0.0):
+    subprocess.run(["gamescopectl", "bottom_screen_touch", f"{kind} {tid} {x:.6f} {y:.6f}"],
+                   check=False, capture_output=True, timeout=10)
+
+
+def touch_events(since, window=None):
+    return [e for e in TOUCH[since:] if window is None or e[1] == window]
+
+
+def scenario_touch():
+    main = Win("[60/60] melonDS 1.0", RED, (512, 384))
+    main.map()
+    pump(1.0)
+    size = (256, 192)
+    second = Win("[w2] [60/60] melonDS 1.0", BLUE, size, transient_for=main)
+    second.map()
+    pump(1.5)
+
+    # A tap and a drag on the window.
+    n = len(TOUCH)
+    touch("down", 0, *panel_point(size, 64, 48))
+    pump(0.3)
+    touch("motion", 0, *panel_point(size, 200, 150))
+    pump(0.3)
+    touch("up", 0)
+    pump(0.5)
+    got = touch_events(n, second.id)
+    begin = [e for e in got if e[0] == "begin"]
+    check(len(begin) == 1 and abs(begin[0][2] - 64) <= 1 and abs(begin[0][3] - 48) <= 1,
+          f"touch: a tap lands where it was made on the window (got {begin})")
+    check(any(e[0] == "update" and abs(e[2] - 200) <= 1 and abs(e[3] - 150) <= 1 for e in got),
+          f"touch: a drag follows the finger (got {got})")
+    check(sum(e[0] == "end" for e in got) == 1, "touch: lifting the finger ends the touch")
+    check(not touch_events(n, main.id), "touch: the main window gets none of it")
+    check(focused() == main.id, "touch: focus stays on the main window")
+    stack = [c.id for c in root.query_tree().children if c.id in (main.id, second.id)]
+    check(stack[-1:] == [main.id], f"touch: the game is the topmost X window again after the touch (stack {stack})")
+
+    # Two fingers at once each reach the window.
+    n = len(TOUCH)
+    touch("down", 4, *panel_point(size, 30, 30))
+    touch("down", 5, *panel_point(size, 220, 160))
+    pump(0.3)
+    touch("up", 4)
+    touch("up", 5)
+    pump(0.4)
+    got = [e for e in touch_events(n, second.id) if e[0] == "begin"]
+    check(len(got) == 2, f"touch: two fingers are two touches (got {got})")
+
+    # The black bars above and below the window: nobody's.
+    n = len(TOUCH)
+    touch("down", 1, *panel_from_logical(0.5, 20 / logical_size()[1]))
+    pump(0.2)
+    touch("up", 1)
+    pump(0.3)
+    check(not touch_events(n), f"touch: a tap on the black bars reaches no window (got {touch_events(n)})")
+
+    # Once the window closes the panel's touches go back to the lease's
+    # holder (none here), not to the game.
+    second.unmap()
+    pump(1.0)
+    n = len(TOUCH)
+    touch("down", 2, 0.5, 0.5)
+    pump(0.2)
+    touch("up", 2)
+    pump(0.3)
+    check(not touch_events(n), "touch: with no bottom window the panel's touches reach no window")
+
+    # A finger kept down while the window closes.
+    second2 = Win("[w2] [60/60] melonDS 1.0", GREEN, size, transient_for=main)
+    second2.map()
+    pump(1.5)
+    touch("down", 3, *panel_point(size, 100, 100))
+    pump(0.3)
+    second2.unmap()
+    pump(1.0)
+    touch("motion", 3, *panel_point(size, 120, 120))
+    touch("up", 3)
+    pump(0.3)
+    check("bottom-screen" in log_text() and focused() == main.id,
+          "touch: a window closing under a finger leaves gamescope running, focus on the game")
 
 
 def scenario_disabled():
