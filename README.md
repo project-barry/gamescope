@@ -1,3 +1,12 @@
+> [!IMPORTANT]
+> **Project Barry's additions to this fork were built with a coding agent:
+> [Claude Code](https://www.anthropic.com/claude-code), running Anthropic's
+> Claude Opus 5.5 (`claude-opus-5-5`).** This applies only to what Project
+> Barry added (the dual-screen changes on the `dual-screen` branch, see [DUAL-SCREEN.md](DUAL-SCREEN.md)): Claude wrote that code, its commit messages and this
+> note. Everything else is upstream [gamescope](https://github.com/ValveSoftware/gamescope)'s work, by its own authors. People set
+> the goals, made the decisions and did the hands-on testing. Review the code
+> before you rely on it. See [a note from lavachemist](https://github.com/project-barry), a human, on Project Barry and generative AI.
+
 > **This fork's `dual-screen` branch** adds second-panel support for dual-screen
 > handhelds (AYN Thor). Work in progress; see [DUAL-SCREEN.md](DUAL-SCREEN.md).
 
