@@ -468,7 +468,7 @@ static void wlserver_handle_touch_down(struct wl_listener *listener, void *data)
 	struct wlserver_touch *touch = wl_container_of( listener, touch, down );
 	struct wlr_touch_down_event *event = (struct wlr_touch_down_event *) data;
 
-	if ( touch->bIgnoreWhileLeased && g_nActiveLeaseClients.load() > 0 )
+	if ( touch->bIgnoreWhileLeased )
 	{
 		drm_lease_send_touch( DrmLeaseEventType::Down, event->x, event->y, event->touch_id, event->time_msec );
 		return;
@@ -483,7 +483,7 @@ static void wlserver_handle_touch_up(struct wl_listener *listener, void *data)
 	struct wlserver_touch *touch = wl_container_of( listener, touch, up );
 	struct wlr_touch_up_event *event = (struct wlr_touch_up_event *) data;
 
-	if ( touch->bIgnoreWhileLeased && g_nActiveLeaseClients.load() > 0 )
+	if ( touch->bIgnoreWhileLeased )
 	{
 		drm_lease_send_touch( DrmLeaseEventType::Up, 0.0, 0.0, event->touch_id, event->time_msec );
 		return;
@@ -497,7 +497,7 @@ static void wlserver_handle_touch_motion(struct wl_listener *listener, void *dat
 	struct wlserver_touch *touch = wl_container_of( listener, touch, motion );
 	struct wlr_touch_motion_event *event = (struct wlr_touch_motion_event *) data;
 
-	if ( touch->bIgnoreWhileLeased && g_nActiveLeaseClients.load() > 0 )
+	if ( touch->bIgnoreWhileLeased )
 	{
 		drm_lease_send_touch( DrmLeaseEventType::Motion, event->x, event->y, event->touch_id, event->time_msec );
 		return;
