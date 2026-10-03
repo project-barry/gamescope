@@ -1,8 +1,7 @@
 # gamescope for dual-screen handhelds
 
-**Work in progress. The bottom-screen drawing, the emulator window rules and
-touch on the bottom screen are untested on hardware** (tested headless, see
-below).
+**Work in progress. The bottom screen (items 3 to 6 below) is untested on
+hardware** (tested headless, see below).
 
 This branch (`dual-screen`) teaches gamescope to use the second panel of a
 dual-screen handheld such as the AYN Thor. It is what [PB-OS](https://github.com/project-barry/pb-os)
@@ -75,6 +74,18 @@ first lease commit is the place to start. PB-OS builds this branch as is.
 
    Not yet known: whether Cemu's GamePad view, which reads mouse clicks,
    takes these touches (through GTK).
+6. **`GAMESCOPE_BOTTOM_SCREEN_YIELD`** (root window property, 32-bit,
+   non-zero): the bottom screen goes back to the lease's holder, with its
+   touches, for as long as the property is set; an overlay there (PB-OS:
+   Barry Launcher's performance dashboard, on the AYN button) can show over
+   a dual-screen game. The window the bottom screen showed, or one that
+   comes meanwhile, waits: it stays out of focus and off the main output,
+   and is shown again once the property is removed.
+
+   ```
+   xprop -root -f GAMESCOPE_BOTTOM_SCREEN_YIELD 32c -set GAMESCOPE_BOTTOM_SCREEN_YIELD 1
+   xprop -root -remove GAMESCOPE_BOTTOM_SCREEN_YIELD
+   ```
 
 ## Testing without the panel
 
@@ -84,13 +95,12 @@ backend, headless included: windows are picked, focus is kept and frames
 are drawn exactly as for the real panel, only not scanned out. With
 `GAMESCOPE_BOTTOM_SCREEN_SIMULATE_PNG=<path>` the newest frame is saved
 there twice a second. `tests/dual-screen/` uses it, with
-`bottom_screen_touch`, to check the window rules, focus, drawing and touch
-under a headless gamescope.
+`bottom_screen_touch`, to check the window rules, focus, drawing, touch and
+yielding under a headless gamescope.
 
 ## Planned
 
-- Handing the panel back to the lease's holder on request (an overlay such as
-  a performance dashboard) and taking it again after.
+- Testing all of the above on an AYN Thor.
 
 Also here: the stats pipe reports the game's frame rate (`fps=`) and the
 compositor's (`paintfps=`) once a second, for a bottom-screen dashboard.

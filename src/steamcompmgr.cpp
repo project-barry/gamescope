@@ -7996,6 +7996,11 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 		ctx->force_windows_fullscreen = !!get_prop( ctx, ctx->root, ctx->atoms.gamescopeForceWindowsFullscreen, 0 );
 		MakeFocusDirty();
 	}
+	if ( ev->atom == ctx->atoms.gamescopeBottomScreenYield && ev->window == ctx->root )
+	{
+		ctx->bottom_screen_yield = !!get_prop( ctx, ctx->root, ctx->atoms.gamescopeBottomScreenYield, 0 );
+		hasRepaint = true;
+	}
 	if ( ev->atom == ctx->atoms.gamescopeFocusBottomInset )
 	{
 		// Leave the app at least a quarter of the screen (Barry Launcher's
@@ -9535,6 +9540,7 @@ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_
 	ctx->atoms.gamescopeForceWindowsFullscreen = XInternAtom( ctx->dpy, "GAMESCOPE_FORCE_WINDOWS_FULLSCREEN", false );
 	ctx->atoms.gamescopeFocusBottomInset = XInternAtom( ctx->dpy, "GAMESCOPE_FOCUS_BOTTOM_INSET", false );
 	ctx->atoms.gamescopeBottomScreen = XInternAtom( ctx->dpy, "GAMESCOPE_BOTTOM_SCREEN", false );
+	ctx->atoms.gamescopeBottomScreenYield = XInternAtom( ctx->dpy, "GAMESCOPE_BOTTOM_SCREEN_YIELD", false );
 
 	ctx->atoms.gamescopeColorLut3DOverride = XInternAtom( ctx->dpy, "GAMESCOPE_COLOR_3DLUT_OVERRIDE", false );
 	ctx->atoms.gamescopeColorShaperLutOverride = XInternAtom( ctx->dpy, "GAMESCOPE_COLOR_SHAPERLUT_OVERRIDE", false );
@@ -10356,7 +10362,8 @@ namespace
 	{
 	public:
 		void Tick();
-		bool Shows( const steamcompmgr_win_t *w ) const { return m_bHeld && w == m_pShown; }
+		// Shown, or kept for the panel while it is yielded.
+		bool Shows( const steamcompmgr_win_t *w ) const { return ( m_bHeld || m_bYielded ) && w == m_pShown; }
 
 	private:
 		struct Simulated
@@ -10367,7 +10374,8 @@ namespace
 		static std::optional<Simulated> ParseSimulated();
 
 		steamcompmgr_win_t *FindWindow();
-		void Release();
+		static bool Yielded();
+		void Release( bool bYield = false );
 		void PresentThread();
 		void SetTouchTarget( const BottomScreenTouchTarget *pTarget );
 		void HandleTouches( steamcompmgr_win_t *w );
@@ -10384,6 +10392,9 @@ namespace
 		static constexpr int k_nImages = 3;
 
 		bool m_bHeld = false;
+		// The panel is the lease's holder's on request
+		// (GAMESCOPE_BOTTOM_SCREEN_YIELD) while m_pShown waits for it.
+		bool m_bYielded = false;
 		// Compared only, never followed: FindWindow renews it every tick.
 		const steamcompmgr_win_t *m_pShown = nullptr;
 		uint64_t m_ulRetryAt = 0;
@@ -10591,7 +10602,21 @@ namespace
 		}
 	}
 
-	void CBottomScreen::Release()
+	// GAMESCOPE_BOTTOM_SCREEN_YIELD on any Xwayland's root.
+	bool CBottomScreen::Yielded()
+	{
+		gamescope_xwayland_server_t *server = nullptr;
+		for ( size_t i = 0; ( server = wlserver_get_xwayland_server( i ) ); i++ )
+		{
+			if ( server->ctx->bottom_screen_yield )
+				return true;
+		}
+		return false;
+	}
+
+	// bYield: the window stays claimed (out of focus and the main output)
+	// while the lease's holder has the panel.
+	void CBottomScreen::Release( bool bYield )
 	{
 		{
 			std::unique_lock lock( m_Mutex );
@@ -10606,9 +10631,13 @@ namespace
 		}
 		PanelRelease();
 		m_bHeld = false;
-		m_pShown = nullptr;
+		m_bYielded = bYield;
+		if ( !bYield )
+		{
+			m_pShown = nullptr;
+			MakeFocusDirty();
+		}
 		m_ulLastCommitID = 0;
-		MakeFocusDirty();
 		// The images stay: the panel may scan one out until the lease's
 		// holder has set its own again.
 	}
@@ -10620,6 +10649,30 @@ namespace
 		{
 			if ( m_bHeld )
 				Release();
+			if ( m_bYielded )
+			{
+				m_bYielded = false;
+				m_pShown = nullptr;
+				MakeFocusDirty();
+			}
+			return;
+		}
+
+		if ( Yielded() )
+		{
+			// An overlay on the lease's holder (a performance dashboard)
+			// asked for the panel: it goes back, the window waits.
+			if ( m_bHeld )
+			{
+				xwm_log.infof( "bottom-screen: yielding the panel to its lease's holder" );
+				Release( true );
+			}
+			if ( w != m_pShown )
+			{
+				m_bYielded = true;
+				m_pShown = w;
+				MakeFocusDirty();
+			}
 			return;
 		}
 
@@ -10649,6 +10702,7 @@ namespace
 			}
 			m_Info = info;
 			m_bHeld = true;
+			m_bYielded = false; // the window was kept out of focus meanwhile
 			m_pShown = nullptr;
 			m_ulLastCommitID = 0;
 			if ( !m_bThreadStarted )
