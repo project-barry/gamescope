@@ -9541,6 +9541,7 @@ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_
 	ctx->atoms.gamescopeFocusBottomInset = XInternAtom( ctx->dpy, "GAMESCOPE_FOCUS_BOTTOM_INSET", false );
 	ctx->atoms.gamescopeBottomScreen = XInternAtom( ctx->dpy, "GAMESCOPE_BOTTOM_SCREEN", false );
 	ctx->atoms.gamescopeBottomScreenYield = XInternAtom( ctx->dpy, "GAMESCOPE_BOTTOM_SCREEN_YIELD", false );
+	ctx->atoms.gamescopeBottomScreenShowing = XInternAtom( ctx->dpy, "GAMESCOPE_BOTTOM_SCREEN_SHOWING", false );
 
 	ctx->atoms.gamescopeColorLut3DOverride = XInternAtom( ctx->dpy, "GAMESCOPE_COLOR_3DLUT_OVERRIDE", false );
 	ctx->atoms.gamescopeColorShaperLutOverride = XInternAtom( ctx->dpy, "GAMESCOPE_COLOR_SHAPERLUT_OVERRIDE", false );
@@ -10375,6 +10376,7 @@ namespace
 
 		steamcompmgr_win_t *FindWindow();
 		static bool Yielded();
+		void PublishShowing( bool bShowing );
 		void Release( bool bYield = false );
 		void PresentThread();
 		void SetTouchTarget( const BottomScreenTouchTarget *pTarget );
@@ -10388,6 +10390,7 @@ namespace
 		uint64_t m_ulLastPng = 0;
 		std::optional<BottomScreenTouchTarget> m_oTouchTarget;
 		bool m_bRaisedForTouch = false;
+		bool m_bPublishedShowing = false;
 
 		static constexpr int k_nImages = 3;
 
@@ -10614,6 +10617,32 @@ namespace
 		return false;
 	}
 
+	// GAMESCOPE_BOTTOM_SCREEN_SHOWING on every Xwayland's root, 1 while the
+	// panel shows a window of ours rather than its lease's holder's: an
+	// on-screen keyboard there can tell whether it is seen.
+	void CBottomScreen::PublishShowing( bool bShowing )
+	{
+		if ( bShowing == m_bPublishedShowing )
+			return;
+		m_bPublishedShowing = bShowing;
+		gamescope_xwayland_server_t *server = nullptr;
+		for ( size_t i = 0; ( server = wlserver_get_xwayland_server( i ) ); i++ )
+		{
+			xwayland_ctx_t *ctx = server->ctx.get();
+			if ( bShowing )
+			{
+				uint32_t uValue = 1;
+				XChangeProperty( ctx->dpy, ctx->root, ctx->atoms.gamescopeBottomScreenShowing, XA_CARDINAL, 32,
+					PropModeReplace, (unsigned char *)&uValue, 1 );
+			}
+			else
+			{
+				XDeleteProperty( ctx->dpy, ctx->root, ctx->atoms.gamescopeBottomScreenShowing );
+			}
+			XFlush( ctx->dpy );
+		}
+	}
+
 	// bYield: the window stays claimed (out of focus and the main output)
 	// while the lease's holder has the panel.
 	void CBottomScreen::Release( bool bYield )
@@ -10630,6 +10659,7 @@ namespace
 			MakeFocusDirty();
 		}
 		PanelRelease();
+		PublishShowing( false );
 		m_bHeld = false;
 		m_bYielded = bYield;
 		if ( !bYield )
@@ -10719,6 +10749,7 @@ namespace
 				w->isBottomScreen ? "property" : "title" );
 			// Leaves focus, or gets it back, from here on.
 			m_pShown = w;
+			PublishShowing( true );
 			m_ulLastCommitID = 0;
 			MakeFocusDirty();
 
