@@ -4604,7 +4604,8 @@ gamescope::Rc<CVulkanTexture> vulkan_create_bottom_screen_image( uint32_t uWidth
 
 // Composites frameInfo's layers into pTarget, a bottom screen image, turned by
 // uRotation steps like the main output (the layers are laid out in the
-// turned, logical space). Plain blit, no output color management.
+// turned, logical space). Plain blit without color management LUTs; layers
+// are blended linear and encoded as frameInfo->outputEncodingEOTF.
 std::optional<uint64_t> vulkan_composite_bottom_screen( const struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pTarget, uint32_t uRotation )
 {
 	auto cmdBuffer = g_device.commandBuffer();
@@ -4612,7 +4613,7 @@ std::optional<uint64_t> vulkan_composite_bottom_screen( const struct FrameInfo_t
 	for (uint32_t i = 0; i < EOTF_Count; i++)
 		cmdBuffer->bindColorMgmtLuts(i, nullptr, nullptr);
 
-	cmdBuffer->bindPipeline( g_device.pipeline(SHADER_TYPE_BLIT, frameInfo->layers.count(), frameInfo->ycbcrMask(), 0u, frameInfo->colorspaceMask(), EOTF_Count ));
+	cmdBuffer->bindPipeline( g_device.pipeline(SHADER_TYPE_BLIT, frameInfo->layers.count(), frameInfo->ycbcrMask(), 0u, frameInfo->colorspaceMask(), frameInfo->outputEncodingEOTF ));
 	bind_all_layers(cmdBuffer.get(), frameInfo);
 	cmdBuffer->bindTarget(pTarget);
 	cmdBuffer->uploadConstants<BlitPushData_t>(frameInfo, uRotation);
