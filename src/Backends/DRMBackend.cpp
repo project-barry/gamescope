@@ -1627,123 +1627,146 @@ gamescope_liftoff_log_handler(enum liftoff_log_priority liftoff_priority, const 
 	liftoff_log_scope.vlogf(priority, fmt, args);
 }
 
+static std::mutex g_leaseClientMutex;
+static int g_nLeaseClientFd = -1;
+static bool g_bLeaseClientWantsTouch = false;
+
+static bool lease_send_fd( int nClientFd, int nLeaseFd )
+{
+	union {
+		char buf[ CMSG_SPACE( sizeof(int) ) ];
+		struct cmsghdr align;
+	} control = {};
+	char data = 'L';
+	struct iovec iov = { .iov_base = &data, .iov_len = 1 };
+	struct msghdr msg = {
+		.msg_iov = &iov,
+		.msg_iovlen = 1,
+		.msg_control = control.buf,
+		.msg_controllen = sizeof( control.buf ),
+	};
+	struct cmsghdr *cmsg = CMSG_FIRSTHDR( &msg );
+	cmsg->cmsg_level = SOL_SOCKET;
+	cmsg->cmsg_type = SCM_RIGHTS;
+	cmsg->cmsg_len = CMSG_LEN( sizeof(int) );
+	memcpy( CMSG_DATA( cmsg ), &nLeaseFd, sizeof(int) );
+
+	return sendmsg( nClientFd, &msg, MSG_NOSIGNAL ) == 1;
+}
+
+static void lease_disconnect_client( int &nClientFd )
+{
+	if ( nClientFd < 0 )
+		return;
+
+	{
+		std::lock_guard lock( g_leaseClientMutex );
+		g_nLeaseClientFd = -1;
+		g_bLeaseClientWantsTouch = false;
+	}
+	close( nClientFd );
+	nClientFd = -1;
+	{
+		std::scoped_lock grantLock( g_LeaseGrantMutex );
+		g_nActiveLeaseClients.fetch_sub( 1 );
+	}
+	drm_log.infof( "lease-connector: companion app disconnected" );
+}
+
+void drm_lease_send_touch( DrmLeaseEventType type, double x, double y, int touchId, uint32_t time )
+{
+	static_assert( sizeof( DrmLeaseEvent ) == 20 );
+	std::lock_guard lock( g_leaseClientMutex );
+	if ( !g_bLeaseClientWantsTouch )
+		return;
+
+	DrmLeaseEvent event = {
+		.type = type,
+		.touchId = touchId,
+		.time = time,
+		.x = static_cast<float>( x ),
+		.y = static_cast<float>( y ),
+	};
+	if ( send( g_nLeaseClientFd, &event, sizeof( event ), MSG_DONTWAIT | MSG_NOSIGNAL ) != sizeof( event ) )
+		shutdown( g_nLeaseClientFd, SHUT_RDWR );
+}
+
 static void lease_socket_thread_run( struct drm_t *drm )
 {
 	pthread_setname_np( pthread_self(), "gs-lease-sock" );
-
-	// Keep client fds open for the lifetime of the companion process so we
-	// can detect when it exits (POLLHUP on the socket). This drives the
-	// g_nActiveLeaseClients counter, which gates whether wlserver drops
-	// touch events for the --ignore-touch-device device (Game Mode) or
-	// forwards them (Desktop Mode, companion not running).
-	std::vector<int> clientFds;
+	int nClientFd = -1;
 
 	while ( drm->bLeaseThreadRunning.load() )
 	{
-		std::vector<struct pollfd> pfds;
-		pfds.reserve( clientFds.size() + 1 );
-
-		struct pollfd listenPfd = {};
-		listenPfd.fd = drm->nLeaseSocketFd;
-		listenPfd.events = POLLIN;
-		pfds.push_back( listenPfd );
-
-		for ( int cfd : clientFds )
-		{
-			struct pollfd cp = {};
-			cp.fd = cfd;
-			cp.events = 0; // we only care about hangup/error
-			pfds.push_back( cp );
-		}
-
-		int ret = poll( pfds.data(), pfds.size(), 1000 );
+		struct pollfd pfds[2] = {
+			{ .fd = drm->nLeaseSocketFd, .events = POLLIN },
+			{ .fd = nClientFd, .events = POLLIN },
+		};
+		int ret = poll( pfds, nClientFd >= 0 ? 2 : 1, 1000 );
 		if ( ret <= 0 )
 			continue;
 
-		// Reap any disconnected companions first.
-		for ( size_t i = clientFds.size(); i-- > 0; )
+		if ( nClientFd >= 0 && pfds[1].revents & ( POLLHUP | POLLERR | POLLNVAL ) )
+			lease_disconnect_client( nClientFd );
+
+		if ( nClientFd >= 0 && pfds[1].revents & POLLIN )
 		{
-			short revents = pfds[ i + 1 ].revents;
-			if ( revents & ( POLLHUP | POLLERR | POLLNVAL ) )
+			char request = 0;
+			ssize_t nRead = recv( nClientFd, &request, 1, MSG_DONTWAIT );
+			if ( nRead == 0 )
+				lease_disconnect_client( nClientFd );
+			else if ( nRead < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK )
+				lease_disconnect_client( nClientFd );
+			else if ( request == 'I' )
 			{
-				close( clientFds[ i ] );
-				clientFds.erase( clientFds.begin() + i );
-				int nRemaining;
-				{
-					std::scoped_lock grantLock( g_LeaseGrantMutex );
-					nRemaining = g_nActiveLeaseClients.fetch_sub( 1 ) - 1;
-				}
-				drm_log.infof( "lease-connector: companion app disconnected (%d still connected)", nRemaining );
+				std::lock_guard lock( g_leaseClientMutex );
+				g_bLeaseClientWantsTouch = true;
+				drm_log.infof( "lease-connector: companion requested touch input" );
 			}
 		}
 
-		if ( !( pfds[ 0 ].revents & POLLIN ) )
+		if ( !( pfds[0].revents & POLLIN ) )
 			continue;
 
-		int nClientFd = accept( drm->nLeaseSocketFd, nullptr, nullptr );
-		if ( nClientFd < 0 )
+		int nAcceptedFd = accept4( drm->nLeaseSocketFd, nullptr, nullptr, SOCK_CLOEXEC );
+		if ( nAcceptedFd < 0 )
 			continue;
+		if ( nClientFd >= 0 )
+		{
+			send( nAcceptedFd, "B", 1, MSG_NOSIGNAL );
+			close( nAcceptedFd );
+			drm_log.infof( "lease-connector: rejected companion while lease is busy" );
+			continue;
+		}
 
 		std::unique_lock<std::mutex> grantLock( g_LeaseGrantMutex );
-
 		if ( g_nProtocolLeaseHolders.load() > 0 )
 		{
 			grantLock.unlock();
 			drm_log.infof( "lease-connector: refusing socket companion, lease is held via drm-lease-v1" );
-			close( nClientFd );
+			close( nAcceptedFd );
 			continue;
 		}
-
-		// Send the DRM lease fd via SCM_RIGHTS
-		union {
-			char buf[ CMSG_SPACE( sizeof(int) ) ];
-			struct cmsghdr align;
-		} u;
-		memset( &u, 0, sizeof(u) );
-
-		char data = 'L';
-		struct iovec iov = {};
-		iov.iov_base = &data;
-		iov.iov_len = 1;
-
-		struct msghdr msg = {};
-		msg.msg_iov = &iov;
-		msg.msg_iovlen = 1;
-		msg.msg_control = u.buf;
-		msg.msg_controllen = sizeof( u.buf );
-
-		struct cmsghdr *cmsg = CMSG_FIRSTHDR( &msg );
-		cmsg->cmsg_level = SOL_SOCKET;
-		cmsg->cmsg_type = SCM_RIGHTS;
-		cmsg->cmsg_len = CMSG_LEN( sizeof(int) );
-		memcpy( CMSG_DATA( cmsg ), &drm->nLeaseFd, sizeof(int) );
-
-		ssize_t nSent = sendmsg( nClientFd, &msg, 0 );
-		if ( nSent < 0 )
+		if ( !lease_send_fd( nAcceptedFd, drm->nLeaseFd ) )
 		{
 			grantLock.unlock();
 			drm_log.errorf( "lease-connector: sendmsg failed: %s", strerror( errno ) );
-			close( nClientFd );
+			close( nAcceptedFd );
+			continue;
 		}
-		else
+
+		nClientFd = nAcceptedFd;
 		{
-			// Keep the client fd open. The companion is expected to hold its
-			// end of the socket for its entire lifetime; closing it signals
-			// us that it's gone and touch events should flow to wlserver again.
-			clientFds.push_back( nClientFd );
-			int nNow = g_nActiveLeaseClients.fetch_add( 1 ) + 1;
-			grantLock.unlock();
-			drm_log.infof( "lease-connector: sent lease fd to companion app (%d connected)", nNow );
+			std::lock_guard lock( g_leaseClientMutex );
+			g_nLeaseClientFd = nClientFd;
+			g_bLeaseClientWantsTouch = false;
 		}
+		g_nActiveLeaseClients.fetch_add( 1 );
+		grantLock.unlock();
+		drm_log.infof( "lease-connector: sent lease fd to companion app" );
 	}
 
-	for ( int cfd : clientFds )
-		close( cfd );
-	if ( !clientFds.empty() )
-	{
-		std::scoped_lock grantLock( g_LeaseGrantMutex );
-		g_nActiveLeaseClients.fetch_sub( (int)clientFds.size() );
-	}
+	lease_disconnect_client( nClientFd );
 }
 
 bool init_drm(struct drm_t *drm, int width, int height, int refresh)

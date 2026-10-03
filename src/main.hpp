@@ -34,6 +34,7 @@ extern bool g_bForceCompositionRotation;
 extern uint32_t g_uOutputRotation;
 
 extern bool g_bFullscreen;
+extern const char *g_sDrmLeaseClientSocket;
 
 extern bool g_bGrabbed;
 
@@ -52,6 +53,24 @@ int drm_lease_dup_fd();
 int drm_lease_open_enum_fd();
 const char *drm_lease_connector_name();
 uint32_t drm_lease_connector_id();
+
+enum class DrmLeaseEventType : uint32_t
+{
+	Down = 1,
+	Motion,
+	Up,
+};
+
+struct DrmLeaseEvent
+{
+	DrmLeaseEventType type;
+	int32_t touchId;
+	uint32_t time;
+	float x;
+	float y;
+};
+
+void drm_lease_send_touch( DrmLeaseEventType type, double x, double y, int touchId, uint32_t time );
 
 enum class GamescopeUpscaleFilter : uint32_t
 {

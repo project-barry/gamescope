@@ -469,7 +469,10 @@ static void wlserver_handle_touch_down(struct wl_listener *listener, void *data)
 	struct wlr_touch_down_event *event = (struct wlr_touch_down_event *) data;
 
 	if ( touch->bIgnoreWhileLeased && g_nActiveLeaseClients.load() > 0 )
+	{
+		drm_lease_send_touch( DrmLeaseEventType::Down, event->x, event->y, event->touch_id, event->time_msec );
 		return;
+	}
 
 	wlserver_touch_associate_connector( touch );
 	wlserver_touchdown( event->x, event->y, event->touch_id, event->time_msec, touch->connector );
@@ -481,7 +484,10 @@ static void wlserver_handle_touch_up(struct wl_listener *listener, void *data)
 	struct wlr_touch_up_event *event = (struct wlr_touch_up_event *) data;
 
 	if ( touch->bIgnoreWhileLeased && g_nActiveLeaseClients.load() > 0 )
+	{
+		drm_lease_send_touch( DrmLeaseEventType::Up, 0.0, 0.0, event->touch_id, event->time_msec );
 		return;
+	}
 
 	wlserver_touchup( event->touch_id, event->time_msec );
 }
@@ -492,7 +498,10 @@ static void wlserver_handle_touch_motion(struct wl_listener *listener, void *dat
 	struct wlr_touch_motion_event *event = (struct wlr_touch_motion_event *) data;
 
 	if ( touch->bIgnoreWhileLeased && g_nActiveLeaseClients.load() > 0 )
+	{
+		drm_lease_send_touch( DrmLeaseEventType::Motion, event->x, event->y, event->touch_id, event->time_msec );
 		return;
+	}
 
 	wlserver_touch_associate_connector( touch );
 	wlserver_touchmotion( event->x, event->y, event->touch_id, event->time_msec, false, touch->connector );
@@ -1917,9 +1926,131 @@ void wlserver_refresh_cycle( struct wlr_surface *surface, uint64_t refresh_cycle
 ///////////////////////
 
 #if HAVE_SESSION
+static int g_nDrmLeaseFd = -1;
+static int g_nDrmLeaseSocketFd = -1;
+static struct wl_event_source *g_pDrmLeaseEventSource = nullptr;
+static DrmLeaseEvent g_drmLeaseEvent = {};
+static size_t g_nDrmLeaseEventBytes = 0;
+
+static void drm_lease_client_dispatch_event()
+{
+	auto *pConnector = GetBackend()->GetCurrentConnector();
+	switch ( g_drmLeaseEvent.type )
+	{
+		case DrmLeaseEventType::Down:
+			wlserver_touchdown( g_drmLeaseEvent.x, g_drmLeaseEvent.y,
+				g_drmLeaseEvent.touchId, g_drmLeaseEvent.time, pConnector );
+			break;
+		case DrmLeaseEventType::Motion:
+			wlserver_touchmotion( g_drmLeaseEvent.x, g_drmLeaseEvent.y,
+				g_drmLeaseEvent.touchId, g_drmLeaseEvent.time, false, pConnector );
+			break;
+		case DrmLeaseEventType::Up:
+			wlserver_touchup( g_drmLeaseEvent.touchId, g_drmLeaseEvent.time );
+			break;
+	}
+}
+
+static int drm_lease_client_disconnected()
+{
+	wl_log.errorf( "DRM lease broker disconnected" );
+	raise( SIGTERM );
+	return 0;
+}
+
+static int drm_lease_client_event( int fd, uint32_t mask, void * )
+{
+	if ( mask & ( WL_EVENT_HANGUP | WL_EVENT_ERROR ) )
+		return drm_lease_client_disconnected();
+
+	while ( true )
+	{
+		char *pWrite = reinterpret_cast<char *>( &g_drmLeaseEvent ) + g_nDrmLeaseEventBytes;
+		ssize_t nRead = recv( fd, pWrite, sizeof( g_drmLeaseEvent ) - g_nDrmLeaseEventBytes, MSG_DONTWAIT );
+		if ( nRead > 0 )
+		{
+			g_nDrmLeaseEventBytes += nRead;
+			if ( g_nDrmLeaseEventBytes != sizeof( g_drmLeaseEvent ) )
+				continue;
+			drm_lease_client_dispatch_event();
+			g_nDrmLeaseEventBytes = 0;
+			continue;
+		}
+		if ( nRead == 0 )
+			return drm_lease_client_disconnected();
+		if ( errno == EINTR )
+			continue;
+		if ( errno == EAGAIN || errno == EWOULDBLOCK )
+			return 0;
+		return drm_lease_client_disconnected();
+	}
+}
+
+static int drm_lease_client_open()
+{
+	int nSocketFd = socket( AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0 );
+	if ( nSocketFd < 0 )
+	{
+		wl_log.errorf_errno( "DRM lease socket creation failed" );
+		return -1;
+	}
+
+	int nLeaseFd = -1;
+	auto Fail = [&]( const char *pszMessage )
+	{
+		wl_log.errorf( "%s", pszMessage );
+		if ( nLeaseFd >= 0 )
+			close( nLeaseFd );
+		close( nSocketFd );
+		return -1;
+	};
+	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+	if ( strlen( g_sDrmLeaseClientSocket ) >= sizeof( addr.sun_path ) )
+		return Fail( "DRM lease socket path is too long" );
+	strcpy( addr.sun_path, g_sDrmLeaseClientSocket );
+	if ( connect( nSocketFd, reinterpret_cast<struct sockaddr *>( &addr ), sizeof( addr ) ) < 0 )
+		return Fail( "Could not connect to DRM lease broker" );
+
+	char data = 0;
+	struct iovec iov = { .iov_base = &data, .iov_len = 1 };
+	char control[ CMSG_SPACE( sizeof(int) ) ] = {};
+	struct msghdr msg = {
+		.msg_iov = &iov,
+		.msg_iovlen = 1,
+		.msg_control = control,
+		.msg_controllen = sizeof( control ),
+	};
+	if ( recvmsg( nSocketFd, &msg, MSG_CMSG_CLOEXEC ) != 1 )
+		return Fail( "Could not receive DRM lease" );
+	if ( data == 'B' )
+		return Fail( "DRM lease is busy" );
+	if ( data != 'L' )
+		return Fail( "DRM lease broker returned an invalid response" );
+
+	struct cmsghdr *cmsg = CMSG_FIRSTHDR( &msg );
+	if ( !cmsg || cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS )
+		return Fail( "DRM lease broker returned no file descriptor" );
+	memcpy( &nLeaseFd, CMSG_DATA( cmsg ), sizeof( nLeaseFd ) );
+	if ( send( nSocketFd, "I", 1, MSG_NOSIGNAL ) != 1 )
+		return Fail( "Could not request DRM lease touch input" );
+
+	int nFlags = fcntl( nSocketFd, F_GETFL );
+	if ( nFlags < 0 || fcntl( nSocketFd, F_SETFL, nFlags | O_NONBLOCK ) < 0 )
+		return Fail( "Could not make DRM lease socket nonblocking" );
+	g_pDrmLeaseEventSource = wl_event_loop_add_fd( wlserver.event_loop, nSocketFd,
+		WL_EVENT_READABLE | WL_EVENT_HANGUP | WL_EVENT_ERROR, drm_lease_client_event, nullptr );
+	if ( !g_pDrmLeaseEventSource )
+		return Fail( "Could not monitor DRM lease socket" );
+
+	g_nDrmLeaseFd = nLeaseFd;
+	g_nDrmLeaseSocketFd = nSocketFd;
+	wl_log.infof( "Using DRM lease from '%s'", g_sDrmLeaseClientSocket );
+	return g_nDrmLeaseFd;
+}
+
 bool wlsession_active()
 {
-	return wlserver.wlr.session->active;
+	return !wlserver.wlr.session || wlserver.wlr.session->active;
 }
 
 static void handle_session_active( struct wl_listener *listener, void *data )
@@ -2128,7 +2259,7 @@ bool wlsession_init( void ) {
 	wlserver_set_output_info( &output_info );
 
 #if HAVE_SESSION
-	if ( !GetBackend()->IsSessionBased() )
+	if ( !GetBackend()->IsSessionBased() || g_sDrmLeaseClientSocket )
 	{
 		s_bInitted = true;
 		return true;
@@ -2161,6 +2292,9 @@ static void kms_device_handle_change( struct wl_listener *listener, void *data )
 }
 
 int wlsession_open_kms( const char *device_name ) {
+	if ( g_sDrmLeaseClientSocket )
+		return drm_lease_client_open();
+
 	if ( device_name != nullptr )
 	{
 		wlserver.wlr.device = wlr_session_open_file( wlserver.wlr.session, device_name );
@@ -2190,6 +2324,20 @@ int wlsession_open_kms( const char *device_name ) {
 
 void wlsession_close_kms()
 {
+	if ( g_sDrmLeaseClientSocket )
+	{
+		if ( g_pDrmLeaseEventSource )
+			wl_event_source_remove( g_pDrmLeaseEventSource );
+		if ( g_nDrmLeaseFd >= 0 )
+			close( g_nDrmLeaseFd );
+		if ( g_nDrmLeaseSocketFd >= 0 )
+			close( g_nDrmLeaseSocketFd );
+		g_pDrmLeaseEventSource = nullptr;
+		g_nDrmLeaseFd = -1;
+		g_nDrmLeaseSocketFd = -1;
+		return;
+	}
+
 	if ( wlserver.wlr.device )
 	{
 		wl_list_remove( &wlserver.wlr.device_change_listener.link );
@@ -2532,7 +2680,7 @@ bool wlserver_init( void ) {
 
 	wl_signal_add( &wlserver.wlr.multi_backend->events.new_input, &new_input_listener );
 
-	if ( GetBackend()->IsSessionBased() )
+	if ( wlserver.wlr.session )
 	{
 #if HAVE_DRM
 		wlserver.wlr.libinput_backend = wlr_libinput_backend_create( wlserver.wlr.session );
