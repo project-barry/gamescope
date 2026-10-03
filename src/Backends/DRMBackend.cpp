@@ -1655,6 +1655,10 @@ static bool g_bLeaseClientWantsTouch = false;
 static bool g_bLeaseClientYields = false;
 static bool g_bLeaseClientSuspendPending = false;
 static bool g_bLeaseClientSuspended = false;
+// A companion that came while a protocol holder had the lease: it got the
+// fd and a Suspend at once, and has not acknowledged it yet.
+static bool g_bLeaseClientStartSuspended = false;
+static std::chrono::steady_clock::time_point g_leaseClientStartSuspendDeadline;
 static uint64_t g_uLeaseClientGeneration = 0;
 
 static bool lease_send_fd( int nClientFd, int nLeaseFd )
@@ -1692,6 +1696,7 @@ static void lease_disconnect_client( int &nClientFd )
 		g_bLeaseClientYields = false;
 		g_bLeaseClientSuspendPending = false;
 		g_bLeaseClientSuspended = false;
+		g_bLeaseClientStartSuspended = false;
 		g_uLeaseClientGeneration++;
 	}
 	g_leaseClientCv.notify_all();
@@ -1709,7 +1714,7 @@ void drm_lease_send_touch( DrmLeaseEventType type, double x, double y, int touch
 {
 	static_assert( sizeof( DrmLeaseEvent ) == 20 );
 	std::lock_guard lock( g_leaseClientMutex );
-	if ( !g_bLeaseClientWantsTouch || g_bLeaseClientSuspended )
+	if ( !g_bLeaseClientWantsTouch || g_bLeaseClientSuspended || g_bLeaseClientStartSuspended )
 		return;
 
 	DrmLeaseEvent event = {
@@ -1776,6 +1781,15 @@ bool drm_lease_companion_suspend( int nTimeoutMs )
 void drm_lease_companion_resume()
 {
 	std::lock_guard lock( g_leaseClientMutex );
+	if ( g_nLeaseClientFd >= 0 && g_bLeaseClientStartSuspended )
+	{
+		// Given back before the late companion acknowledged its Suspend:
+		// it reads the Resume after it, and its acknowledgement is ignored.
+		g_bLeaseClientStartSuspended = false;
+		if ( lease_send_control( DrmLeaseEventType::Resume ) )
+			drm_log.infof( "lease-connector: companion resumed" );
+		return;
+	}
 	if ( g_nLeaseClientFd < 0 || !g_bLeaseClientSuspended )
 		return;
 	g_bLeaseClientSuspended = false;
@@ -1794,7 +1808,26 @@ static void lease_socket_thread_run( struct drm_t *drm )
 			{ .fd = drm->nLeaseSocketFd, .events = POLLIN },
 			{ .fd = nClientFd, .events = POLLIN },
 		};
-		int ret = poll( pfds, nClientFd >= 0 ? 2 : 1, 1000 );
+		int ret = poll( pfds, nClientFd >= 0 ? 2 : 1, 250 );
+
+		if ( nClientFd >= 0 )
+		{
+			bool bLate;
+			{
+				std::lock_guard lock( g_leaseClientMutex );
+				bLate = g_bLeaseClientStartSuspended &&
+					std::chrono::steady_clock::now() > g_leaseClientStartSuspendDeadline;
+			}
+			if ( bLate )
+			{
+				// It may be driving the panel under the holder: as before,
+				// it is not let in.
+				drm_log.infof( "lease-connector: late companion did not suspend in time" );
+				lease_disconnect_client( nClientFd );
+				continue;
+			}
+		}
+
 		if ( ret <= 0 )
 			continue;
 
@@ -1826,9 +1859,10 @@ static void lease_socket_thread_run( struct drm_t *drm )
 				bool bExpected;
 				{
 					std::lock_guard lock( g_leaseClientMutex );
-					bExpected = g_bLeaseClientSuspendPending;
+					bExpected = g_bLeaseClientSuspendPending || g_bLeaseClientStartSuspended;
 					if ( bExpected )
 						g_bLeaseClientSuspended = true;
+					g_bLeaseClientStartSuspended = false;
 				}
 				g_leaseClientCv.notify_all();
 				if ( bExpected )
@@ -1851,13 +1885,11 @@ static void lease_socket_thread_run( struct drm_t *drm )
 		}
 
 		std::unique_lock<std::mutex> grantLock( g_LeaseGrantMutex );
-		if ( g_nProtocolLeaseHolders.load() > 0 )
-		{
-			grantLock.unlock();
-			drm_log.infof( "lease-connector: refusing socket companion, lease is held via drm-lease-v1" );
-			close( nAcceptedFd );
-			continue;
-		}
+		// While a protocol holder (a drm-lease-v1 client, or the bottom
+		// screen) has the lease, a companion that comes (Barry Launcher
+		// restarted under a dual-screen game) waits suspended until it is
+		// given back, as one already connected would.
+		const bool bStartSuspended = g_nProtocolLeaseHolders.load() > 0;
 		if ( !lease_send_fd( nAcceptedFd, drm->nLeaseFd ) )
 		{
 			grantLock.unlock();
@@ -1867,6 +1899,7 @@ static void lease_socket_thread_run( struct drm_t *drm )
 		}
 
 		nClientFd = nAcceptedFd;
+		bool bSuspendFailed;
 		{
 			std::lock_guard lock( g_leaseClientMutex );
 			g_nLeaseClientFd = nClientFd;
@@ -1874,11 +1907,26 @@ static void lease_socket_thread_run( struct drm_t *drm )
 			g_bLeaseClientYields = false;
 			g_bLeaseClientSuspendPending = false;
 			g_bLeaseClientSuspended = false;
+			g_bLeaseClientStartSuspended = false;
 			g_uLeaseClientGeneration++;
+			if ( bStartSuspended && lease_send_control( DrmLeaseEventType::Suspend ) )
+			{
+				g_bLeaseClientStartSuspended = true;
+				g_leaseClientStartSuspendDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 2 );
+			}
+			bSuspendFailed = bStartSuspended && !g_bLeaseClientStartSuspended;
 		}
 		g_nActiveLeaseClients.fetch_add( 1 );
 		grantLock.unlock();
-		drm_log.infof( "lease-connector: sent lease fd to companion app" );
+		if ( bSuspendFailed )
+		{
+			drm_log.infof( "lease-connector: cannot suspend the companion, the lease is held via drm-lease-v1" );
+			lease_disconnect_client( nClientFd );
+		}
+		else if ( bStartSuspended )
+			drm_log.infof( "lease-connector: sent lease fd to companion app, suspended: the lease is held via drm-lease-v1" );
+		else
+			drm_log.infof( "lease-connector: sent lease fd to companion app" );
 	}
 
 	lease_disconnect_client( nClientFd );

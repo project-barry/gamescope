@@ -29,6 +29,10 @@ first lease commit is the place to start. PB-OS builds this branch as is.
      session on the leased panel (a launcher, a keyboard, a dashboard...).
      With `--drm-lease-yield` it steps aside while a `wp_drm_lease_device_v1`
      client (an emulator that draws its own bottom screen) holds the lease.
+     One that connects while such a client (or the bottom screen, item 3)
+     holds it, as when it is restarted then, starts suspended and gets the
+     panel when they let go; it is dropped if it does not acknowledge the
+     suspension within 2 seconds.
 2. **`GAMESCOPE_FOCUS_BOTTOM_INSET`** (root window property, pixels): an
    on-screen keyboard along the bottom of a screen pushes the focused app up
    instead of covering it.
