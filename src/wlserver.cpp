@@ -54,6 +54,7 @@
 #include "gamescope-xwayland-protocol.h"
 #include "gamescope-pipewire-protocol.h"
 #include "gamescope-control-protocol.h"
+#include "drm-lease-v1-protocol.h"
 #include "gamescope-private-protocol.h"
 #include "gamescope-swapchain-protocol.h"
 #include "presentation-time-protocol.h"
@@ -1521,6 +1522,195 @@ static void create_gamescope_control( void )
 	wl_global_create( wlserver.display, &gamescope_control_interface, gamescope_control_interface.version, NULL, gamescope_control_bind );
 }
 
+
+////////////////////////
+// wp_drm_lease_device_v1
+////////////////////////
+
+static std::vector<struct wl_resource *> s_pActiveDrmLeases;
+
+struct drm_lease_request_state
+{
+	bool bConnectorRequested = false;
+};
+
+static void drm_lease_handle_destroy( struct wl_client *client, struct wl_resource *resource )
+{
+	wl_resource_destroy( resource );
+}
+
+static const struct wp_drm_lease_v1_interface drm_lease_impl = {
+	.destroy = drm_lease_handle_destroy,
+};
+
+static void drm_lease_resource_destroyed( struct wl_resource *resource )
+{
+	std::unique_lock<std::mutex> grantLock( g_LeaseGrantMutex );
+	if ( std::erase( s_pActiveDrmLeases, resource ) > 0 )
+	{
+		g_nProtocolLeaseHolders.fetch_sub( 1 );
+		int nRemaining = g_nActiveLeaseClients.fetch_sub( 1 ) - 1;
+		grantLock.unlock();
+		wl_log.infof( "drm-lease: protocol lease released (%d holders remain)", nRemaining );
+	}
+}
+
+static void drm_lease_connector_handle_destroy( struct wl_client *client, struct wl_resource *resource )
+{
+	wl_resource_destroy( resource );
+}
+
+static const struct wp_drm_lease_connector_v1_interface drm_lease_connector_impl = {
+	.destroy = drm_lease_connector_handle_destroy,
+};
+
+static void drm_lease_request_handle_request_connector( struct wl_client *client, struct wl_resource *resource, struct wl_resource *connector )
+{
+	auto *pState = (drm_lease_request_state *)wl_resource_get_user_data( resource );
+
+	if ( pState->bConnectorRequested )
+	{
+		wl_resource_post_error( resource, WP_DRM_LEASE_REQUEST_V1_ERROR_DUPLICATE_CONNECTOR,
+			"connector requested twice" );
+		return;
+	}
+
+	pState->bConnectorRequested = true;
+}
+
+static void drm_lease_request_handle_submit( struct wl_client *client, struct wl_resource *resource, uint32_t id )
+{
+	auto *pState = (drm_lease_request_state *)wl_resource_get_user_data( resource );
+
+	if ( !pState->bConnectorRequested )
+	{
+		wl_resource_post_error( resource, WP_DRM_LEASE_REQUEST_V1_ERROR_EMPTY_LEASE,
+			"lease submitted with no connectors" );
+		return;
+	}
+
+	struct wl_resource *lease = wl_resource_create( client, &wp_drm_lease_v1_interface,
+		wl_resource_get_version( resource ), id );
+	if ( !lease )
+	{
+		wl_client_post_no_memory( client );
+		return;
+	}
+	wl_resource_set_implementation( lease, &drm_lease_impl, NULL, drm_lease_resource_destroyed );
+
+	// The lease has a single holder across both frontends.
+	bool bGranted = false;
+	{
+		std::unique_lock<std::mutex> grantLock( g_LeaseGrantMutex );
+		if ( g_nActiveLeaseClients.load() == 0 )
+		{
+			int nFd = drm_lease_dup_fd();
+			if ( nFd >= 0 )
+			{
+				wp_drm_lease_v1_send_lease_fd( lease, nFd );
+				close( nFd );
+
+				g_nActiveLeaseClients.fetch_add( 1 );
+				g_nProtocolLeaseHolders.fetch_add( 1 );
+				s_pActiveDrmLeases.push_back( lease );
+				bGranted = true;
+			}
+		}
+	}
+
+	if ( bGranted )
+		wl_log.infof( "drm-lease: granted lease to protocol client" );
+
+	if ( !bGranted )
+	{
+		wl_log.infof( "drm-lease: rejecting lease request, lease already held" );
+		wp_drm_lease_v1_send_finished( lease );
+	}
+
+	wl_resource_destroy( resource );
+}
+
+static const struct wp_drm_lease_request_v1_interface drm_lease_request_impl = {
+	.request_connector = drm_lease_request_handle_request_connector,
+	.submit = drm_lease_request_handle_submit,
+};
+
+static void drm_lease_device_handle_create_lease_request( struct wl_client *client, struct wl_resource *resource, uint32_t id )
+{
+	struct wl_resource *request = wl_resource_create( client, &wp_drm_lease_request_v1_interface,
+		wl_resource_get_version( resource ), id );
+	if ( !request )
+	{
+		wl_client_post_no_memory( client );
+		return;
+	}
+
+	wl_resource_set_implementation( request, &drm_lease_request_impl,
+		new drm_lease_request_state(),
+		[]( struct wl_resource *r )
+		{
+			delete (drm_lease_request_state *)wl_resource_get_user_data( r );
+		});
+}
+
+static void drm_lease_device_handle_release( struct wl_client *client, struct wl_resource *resource )
+{
+	wp_drm_lease_device_v1_send_released( resource );
+	wl_resource_destroy( resource );
+}
+
+static const struct wp_drm_lease_device_v1_interface drm_lease_device_impl = {
+	.create_lease_request = drm_lease_device_handle_create_lease_request,
+	.release = drm_lease_device_handle_release,
+};
+
+static void drm_lease_device_bind( struct wl_client *client, void *data, uint32_t version, uint32_t id )
+{
+	struct wl_resource *resource = wl_resource_create( client, &wp_drm_lease_device_v1_interface, version, id );
+	if ( !resource )
+	{
+		wl_client_post_no_memory( client );
+		return;
+	}
+	wl_resource_set_implementation( resource, &drm_lease_device_impl, NULL, NULL );
+
+	int nEnumFd = drm_lease_open_enum_fd();
+	if ( nEnumFd < 0 )
+	{
+		wl_log.errorf_errno( "drm-lease: failed to open KMS node for enumeration" );
+		wl_resource_post_no_memory( resource );
+		return;
+	}
+	wp_drm_lease_device_v1_send_drm_fd( resource, nEnumFd );
+	close( nEnumFd );
+
+	struct wl_resource *connector = wl_resource_create( client, &wp_drm_lease_connector_v1_interface,
+		wl_resource_get_version( resource ), 0 );
+	if ( !connector )
+	{
+		wl_client_post_no_memory( client );
+		return;
+	}
+	wl_resource_set_implementation( connector, &drm_lease_connector_impl, NULL, NULL );
+
+	wp_drm_lease_device_v1_send_connector( resource, connector );
+	wp_drm_lease_connector_v1_send_name( connector, drm_lease_connector_name() );
+	wp_drm_lease_connector_v1_send_description( connector, "Gamescope leased output" );
+	wp_drm_lease_connector_v1_send_connector_id( connector, drm_lease_connector_id() );
+	wp_drm_lease_connector_v1_send_done( connector );
+
+	wp_drm_lease_device_v1_send_done( resource );
+}
+
+static void create_drm_lease_device( void )
+{
+	if ( !drm_lease_available() )
+		return;
+
+	wl_global_create( wlserver.display, &wp_drm_lease_device_v1_interface, 1, NULL, drm_lease_device_bind );
+	wl_log.infof( "drm-lease: exposing wp_drm_lease_device_v1 for connector '%s'", drm_lease_connector_name() );
+}
+
 ////////////////////////
 // gamescope_private
 ////////////////////////
@@ -2396,6 +2586,8 @@ bool wlserver_init( void ) {
 #endif
 
 	create_gamescope_control();
+
+	create_drm_lease_device();
 
 	create_gamescope_private();
 

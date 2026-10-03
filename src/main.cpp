@@ -716,6 +716,8 @@ const char *g_sOutputName = nullptr;
 const char *g_sLeaseConnectorName = nullptr;
 const char *g_sIgnoreTouchDevice = nullptr;
 std::atomic<int> g_nActiveLeaseClients = { 0 };
+std::atomic<int> g_nProtocolLeaseHolders = { 0 };
+std::mutex g_LeaseGrantMutex;
 bool g_bDebugLayers = false;
 bool g_bForceDisableColorMgmt = false;
 bool g_bRt = false;

@@ -3,6 +3,7 @@
 #include <getopt.h>
 
 #include <atomic>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -38,6 +39,19 @@ extern bool g_bGrabbed;
 
 extern float g_mouseSensitivity;
 extern const char *g_sOutputName;
+
+// Protocol-frontend holders; each is also counted in g_nActiveLeaseClients.
+extern std::atomic<int> g_nProtocolLeaseHolders;
+
+// Lease grants/releases on both frontends mutate the counters under this
+// lock; reads stay lock-free.
+extern std::mutex g_LeaseGrantMutex;
+
+bool drm_lease_available();
+int drm_lease_dup_fd();
+int drm_lease_open_enum_fd();
+const char *drm_lease_connector_name();
+uint32_t drm_lease_connector_id();
 
 enum class GamescopeUpscaleFilter : uint32_t
 {

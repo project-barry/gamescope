@@ -172,6 +172,8 @@ struct drm_t {
 	std::unordered_set< uint32_t > leasedPlaneIds;
 	uint32_t uLeaseId = 0;
 	int nLeaseFd = -1;
+	uint32_t uLeasedConnectorId = 0;
+	std::string sLeasedConnectorName;
 	int nLeaseSocketFd = -1;
 	std::atomic<bool> bLeaseThreadRunning = { false };
 	std::string sLeaseSocketPath;
@@ -1666,7 +1668,11 @@ static void lease_socket_thread_run( struct drm_t *drm )
 			{
 				close( clientFds[ i ] );
 				clientFds.erase( clientFds.begin() + i );
-				int nRemaining = g_nActiveLeaseClients.fetch_sub( 1 ) - 1;
+				int nRemaining;
+				{
+					std::scoped_lock grantLock( g_LeaseGrantMutex );
+					nRemaining = g_nActiveLeaseClients.fetch_sub( 1 ) - 1;
+				}
 				drm_log.infof( "lease-connector: companion app disconnected (%d still connected)", nRemaining );
 			}
 		}
@@ -1677,6 +1683,16 @@ static void lease_socket_thread_run( struct drm_t *drm )
 		int nClientFd = accept( drm->nLeaseSocketFd, nullptr, nullptr );
 		if ( nClientFd < 0 )
 			continue;
+
+		std::unique_lock<std::mutex> grantLock( g_LeaseGrantMutex );
+
+		if ( g_nProtocolLeaseHolders.load() > 0 )
+		{
+			grantLock.unlock();
+			drm_log.infof( "lease-connector: refusing socket companion, lease is held via drm-lease-v1" );
+			close( nClientFd );
+			continue;
+		}
 
 		// Send the DRM lease fd via SCM_RIGHTS
 		union {
@@ -1705,6 +1721,7 @@ static void lease_socket_thread_run( struct drm_t *drm )
 		ssize_t nSent = sendmsg( nClientFd, &msg, 0 );
 		if ( nSent < 0 )
 		{
+			grantLock.unlock();
 			drm_log.errorf( "lease-connector: sendmsg failed: %s", strerror( errno ) );
 			close( nClientFd );
 		}
@@ -1715,6 +1732,7 @@ static void lease_socket_thread_run( struct drm_t *drm )
 			// us that it's gone and touch events should flow to wlserver again.
 			clientFds.push_back( nClientFd );
 			int nNow = g_nActiveLeaseClients.fetch_add( 1 ) + 1;
+			grantLock.unlock();
 			drm_log.infof( "lease-connector: sent lease fd to companion app (%d connected)", nNow );
 		}
 	}
@@ -1722,7 +1740,10 @@ static void lease_socket_thread_run( struct drm_t *drm )
 	for ( int cfd : clientFds )
 		close( cfd );
 	if ( !clientFds.empty() )
+	{
+		std::scoped_lock grantLock( g_LeaseGrantMutex );
 		g_nActiveLeaseClients.fetch_sub( (int)clientFds.size() );
+	}
 }
 
 bool init_drm(struct drm_t *drm, int width, int height, int refresh)
@@ -1982,6 +2003,8 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
 					drm->leasedPlaneIds.insert( uPlaneId );
 					drm->uLeaseId = uLeaseId;
 					drm->nLeaseFd = nLeaseFd;
+					drm->uLeasedConnectorId = uConnectorId;
+					drm->sLeasedConnectorName = pLeaseConnector->GetName();
 
 					drm_log.infof( "lease-connector: leased '%s' (connector=%u, crtc=%u, plane=%u) -> fd=%d, lessee=%u",
 						g_sLeaseConnectorName, uConnectorId, uCRTCId, uPlaneId, nLeaseFd, uLeaseId );
@@ -4382,6 +4405,49 @@ const char *drm_get_connector_name(struct drm_t *drm)
 const char *drm_get_device_name(struct drm_t *drm)
 {
 	return drm->device_name;
+}
+
+bool drm_lease_available()
+{
+	return g_DRM.nLeaseFd >= 0;
+}
+
+int drm_lease_dup_fd()
+{
+	if ( g_DRM.nLeaseFd < 0 )
+		return -1;
+	return fcntl( g_DRM.nLeaseFd, F_DUPFD_CLOEXEC, 0 );
+}
+
+int drm_lease_open_enum_fd()
+{
+	if ( !g_DRM.device_name )
+		return -1;
+
+	int nFd = open( g_DRM.device_name, O_RDWR | O_CLOEXEC );
+	if ( nFd < 0 )
+		return -1;
+
+	// Opening the primary node implicitly grants DRM master when none is
+	// held (e.g. mid VT switch). drm_fd must never carry master.
+	if ( drmIsMaster( nFd ) && drmDropMaster( nFd ) != 0 )
+	{
+		drm_log.errorf( "drm-lease: enum fd unexpectedly master and drop failed" );
+		close( nFd );
+		return -1;
+	}
+
+	return nFd;
+}
+
+const char *drm_lease_connector_name()
+{
+	return g_DRM.sLeasedConnectorName.c_str();
+}
+
+uint32_t drm_lease_connector_id()
+{
+	return g_DRM.uLeasedConnectorId;
 }
 
 std::pair<uint32_t, uint32_t> drm_get_connector_identifier(struct drm_t *drm)
