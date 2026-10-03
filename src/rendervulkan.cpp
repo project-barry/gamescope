@@ -4585,10 +4585,12 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 
 // The leased panel this gamescope draws a window on (the AYN Thor's bottom
 // screen, drm_bottom_screen_*): scanout images of the panel's own size.
-gamescope::Rc<CVulkanTexture> vulkan_create_bottom_screen_image( uint32_t uWidth, uint32_t uHeight )
+gamescope::Rc<CVulkanTexture> vulkan_create_bottom_screen_image( uint32_t uWidth, uint32_t uHeight, bool bReadable )
 {
 	CVulkanTexture::createFlags flags;
-	flags.bFlippable = true;
+	flags.bFlippable = !bReadable;
+	flags.bMappable = bReadable;
+	flags.bLinear = bReadable;
 	flags.bStorage = true;
 	flags.bSampled = true;
 	flags.bOutputImage = true;

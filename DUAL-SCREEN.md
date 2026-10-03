@@ -61,6 +61,16 @@ first lease commit is the place to start. PB-OS builds this branch as is.
    while the panel cannot be taken (no leased panel, or a protocol client
    holds it): gamescope then treats it as upstream does.
 
+## Testing without the panel
+
+`GAMESCOPE_BOTTOM_SCREEN_SIMULATE=WIDTHxHEIGHT[@ROTATION]` (rotation in
+steps of 90°, 0-3, as the main output's) stands in for the leased panel on any
+backend, headless included: windows are picked, focus is kept and frames
+are drawn exactly as for the real panel, only not scanned out. With
+`GAMESCOPE_BOTTOM_SCREEN_SIMULATE_PNG=<path>` the newest frame is saved
+there twice a second. `tests/dual-screen/` uses it to check the window
+rules, focus and drawing under a headless gamescope.
+
 ## Planned
 
 - Touch on the bottom panel going to the window shown there.

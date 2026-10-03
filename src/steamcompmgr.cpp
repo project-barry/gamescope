@@ -10334,8 +10334,15 @@ static void relay_mangoapp_control()
 // and turned like the panel, while the main output and focus leave it out.
 // The panel is taken from the lease's holder while such a window is mapped,
 // and given back when none is; a window matched by title is left as any
-// window while the panel cannot be taken. Drawing happens here on the compositor thread;
-// scanning out, which blocks until the panel shows the frame, on its own.
+// window while the panel cannot be taken. Drawing happens here on the
+// compositor thread; scanning out, which blocks until the panel shows the
+// frame, on its own.
+//
+// GAMESCOPE_BOTTOM_SCREEN_SIMULATE, for testing without the panel (any
+// backend): "WIDTHxHEIGHT" or "WIDTHxHEIGHT@ROTATION" (0-3 steps, as
+// g_uOutputRotation) stands in for it. Frames are drawn as usual, and with
+// GAMESCOPE_BOTTOM_SCREEN_SIMULATE_PNG=<path> the newest is saved there
+// twice a second.
 namespace
 {
 	struct BottomScreenJob
@@ -10352,9 +10359,23 @@ namespace
 		bool Shows( const steamcompmgr_win_t *w ) const { return m_bHeld && w == m_pShown; }
 
 	private:
+		struct Simulated
+		{
+			BottomScreenInfo info;
+			std::string sPng;
+		};
+		static std::optional<Simulated> ParseSimulated();
+
 		steamcompmgr_win_t *FindWindow();
 		void Release();
 		void PresentThread();
+		bool PanelAcquire( BottomScreenInfo *pInfo );
+		bool PanelPresent( const BottomScreenJob &job );
+		void PanelRelease();
+		void SavePng( CVulkanTexture *pImage );
+
+		const std::optional<Simulated> m_oSimulated = ParseSimulated();
+		uint64_t m_ulLastPng = 0;
 
 		static constexpr int k_nImages = 3;
 
@@ -10374,6 +10395,98 @@ namespace
 		bool m_bBusy = false;
 		int m_nOnScreen = -1;
 	};
+
+	std::optional<CBottomScreen::Simulated> CBottomScreen::ParseSimulated()
+	{
+		const char *pszSimulate = getenv( "GAMESCOPE_BOTTOM_SCREEN_SIMULATE" );
+		if ( !pszSimulate || !pszSimulate[0] )
+			return std::nullopt;
+		Simulated simulated = {};
+		if ( sscanf( pszSimulate, "%ux%u@%u", &simulated.info.uWidth, &simulated.info.uHeight, &simulated.info.uRotation ) < 2 ||
+			 !simulated.info.uWidth || !simulated.info.uHeight || simulated.info.uRotation > 3 )
+		{
+			xwm_log.errorf( "GAMESCOPE_BOTTOM_SCREEN_SIMULATE: want WIDTHxHEIGHT or WIDTHxHEIGHT@ROTATION, not '%s'", pszSimulate );
+			return std::nullopt;
+		}
+		if ( const char *pszPng = getenv( "GAMESCOPE_BOTTOM_SCREEN_SIMULATE_PNG" ) )
+			simulated.sPng = pszPng;
+		return simulated;
+	}
+
+	bool CBottomScreen::PanelAcquire( BottomScreenInfo *pInfo )
+	{
+		if ( !m_oSimulated )
+			return drm_bottom_screen_acquire( pInfo );
+		*pInfo = m_oSimulated->info;
+		xwm_log.infof( "bottom-screen: took the simulated panel (%ux%u, rotation %u)",
+			pInfo->uWidth, pInfo->uHeight, pInfo->uRotation );
+		return true;
+	}
+
+	bool CBottomScreen::PanelPresent( const BottomScreenJob &job )
+	{
+		if ( !m_oSimulated )
+			return drm_bottom_screen_present( job.uFbId );
+		// Paced like a 60 Hz panel.
+		std::this_thread::sleep_for( std::chrono::milliseconds( 16 ) );
+		const uint64_t ulNow = get_time_in_nanos();
+		if ( !m_oSimulated->sPng.empty() && ulNow - m_ulLastPng >= 500'000'000ul )
+		{
+			m_ulLastPng = ulNow;
+			SavePng( m_pImages[ job.nImage ].get() );
+		}
+		return true;
+	}
+
+	void CBottomScreen::PanelRelease()
+	{
+		if ( !m_oSimulated )
+			return drm_bottom_screen_release();
+		xwm_log.infof( "bottom-screen: gave the simulated panel back" );
+	}
+
+	void CBottomScreen::SavePng( CVulkanTexture *pImage )
+	{
+		const uint8_t *pData = pImage->mappedData();
+		if ( !pData )
+			return;
+		const uint32_t uWidth = pImage->width(), uHeight = pImage->height();
+		std::vector<uint8_t> rgba( uWidth * uHeight * 4 );
+		for ( uint32_t y = 0; y < uHeight; y++ )
+		{
+			for ( uint32_t x = 0; x < uWidth; x++ )
+			{
+				uint32_t uPixel;
+				memcpy( &uPixel, pData + y * pImage->rowPitch() + x * 4, 4 );
+				uint8_t *pOut = &rgba[ ( y * uWidth + x ) * 4 ];
+				switch ( pImage->format() )
+				{
+					case VK_FORMAT_B8G8R8A8_UNORM:
+					case VK_FORMAT_B8G8R8A8_SRGB:
+						pOut[0] = uPixel >> 16; pOut[1] = uPixel >> 8; pOut[2] = uPixel;
+						break;
+					case VK_FORMAT_R8G8B8A8_UNORM:
+					case VK_FORMAT_R8G8B8A8_SRGB:
+						pOut[0] = uPixel; pOut[1] = uPixel >> 8; pOut[2] = uPixel >> 16;
+						break;
+					case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+						pOut[0] = uPixel >> 22; pOut[1] = uPixel >> 12; pOut[2] = uPixel >> 2;
+						break;
+					case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+						pOut[0] = uPixel >> 2; pOut[1] = uPixel >> 12; pOut[2] = uPixel >> 22;
+						break;
+					default:
+						xwm_log.errorf( "bottom-screen: cannot save format %d as PNG", (int)pImage->format() );
+						return;
+				}
+				pOut[3] = 255;
+			}
+		}
+		// Written aside and renamed, so a reader never sees half a file.
+		const std::string sTemp = m_oSimulated->sPng + ".tmp";
+		if ( stbi_write_png( sTemp.c_str(), uWidth, uHeight, 4, rgba.data(), uWidth * 4 ) )
+			rename( sTemp.c_str(), m_oSimulated->sPng.c_str() );
+	}
 
 	steamcompmgr_win_t *CBottomScreen::FindWindow()
 	{
@@ -10410,7 +10523,7 @@ namespace
 			// The frame is scanned out once the GPU has drawn it.
 			while ( vulkan_completed_seq() < job.ulSeqNo )
 				std::this_thread::sleep_for( std::chrono::microseconds( 500 ) );
-			const bool bShown = drm_bottom_screen_present( job.uFbId );
+			const bool bShown = PanelPresent( job );
 			{
 				std::unique_lock lock( m_Mutex );
 				if ( bShown )
@@ -10429,7 +10542,7 @@ namespace
 			m_Cv.wait( lock, [&] { return !m_bBusy; } );
 			m_nOnScreen = -1;
 		}
-		drm_bottom_screen_release();
+		PanelRelease();
 		m_bHeld = false;
 		m_pShown = nullptr;
 		m_ulLastCommitID = 0;
@@ -10454,7 +10567,7 @@ namespace
 			if ( ulNow < m_ulRetryAt )
 				return;
 			BottomScreenInfo info = {};
-			if ( !drm_bottom_screen_acquire( &info ) )
+			if ( !PanelAcquire( &info ) )
 			{
 				m_ulRetryAt = ulNow + 1'000'000'000ul;
 				return;
@@ -10463,10 +10576,10 @@ namespace
 			{
 				for ( auto &pImage : m_pImages )
 				{
-					pImage = vulkan_create_bottom_screen_image( info.uWidth, info.uHeight );
+					pImage = vulkan_create_bottom_screen_image( info.uWidth, info.uHeight, m_oSimulated.has_value() );
 					if ( !pImage )
 					{
-						drm_bottom_screen_release();
+						PanelRelease();
 						m_ulRetryAt = ulNow + 5'000'000'000ul;
 						return;
 					}
@@ -10486,6 +10599,8 @@ namespace
 
 		if ( w != m_pShown )
 		{
+			xwm_log.infof( "bottom-screen: showing 0x%lx '%s' (%s)", (unsigned long)w->xwayland().id, w->debug_name(),
+				w->isBottomScreen ? "property" : "title" );
 			// Leaves focus, or gets it back, from here on.
 			m_pShown = w;
 			m_ulLastCommitID = 0;
@@ -10508,8 +10623,8 @@ namespace
 		}
 
 		gamescope::Rc<CVulkanTexture> pTex = pCommit->vulkanTex;
-		gamescope::IBackendFb *pFb = m_pImages[ nImage ]->GetBackendFb();
-		if ( !pTex || !pFb )
+		gamescope::IBackendFb *pFb = m_oSimulated ? nullptr : m_pImages[ nImage ]->GetBackendFb();
+		if ( !pTex || ( !m_oSimulated && !pFb ) )
 			return;
 
 		// Fitted into the turned panel, centered, black around it.
@@ -10542,7 +10657,7 @@ namespace
 		{
 			std::unique_lock lock( m_Mutex );
 			m_bBusy = true;
-			m_oJob = BottomScreenJob{ *oSeqNo, drm_bottom_screen_fb_id( pFb ), nImage };
+			m_oJob = BottomScreenJob{ *oSeqNo, pFb ? drm_bottom_screen_fb_id( pFb ) : 0u, nImage };
 		}
 		m_Cv.notify_all();
 	}
