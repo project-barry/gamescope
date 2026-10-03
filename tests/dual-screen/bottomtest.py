@@ -480,6 +480,51 @@ def scenario_stress():
     check(gave_back(m), "stress: the screen is given back at the end")
 
 
+def sim_counts(since=0):
+    """(shown, commits) from each of the simulated panel's 2 s reports."""
+    return [(int(a), int(b)) for a, b in re.findall(
+        r"the simulated panel showed (\d+) frames of (\d+) commits", log_text()[since:])]
+
+
+def scenario_pacing():
+    # The window draws a little slower than the 60 Hz panel, so their
+    # frames pass through every phase of each other: a frame that comes
+    # while the last waits for the panel must still be shown.
+    main = Win("[60/60] melonDS 1.0", RED, (512, 384))
+    main.map()
+    pump(1.0)
+    second = Win("[w2] [60/60] melonDS 1.0", BLUE, (256, 384), transient_for=main)
+    second.map()
+    pump(1.5)
+    Win.alive.remove(main)  # only the bottom window draws from here
+    colors = [second.w.create_gc(foreground=c) for c in (BLUE, GREEN)]
+    m = mark()
+    period, n = 1 / float(os.environ.get("PACING_HZ", "57")), 0
+    start = time.monotonic()
+    while time.monotonic() - start < 8.0:
+        w, h = second.size
+        second.w.fill_rectangle(colors[n % 2], 0, 0, w, h)
+        d.flush()
+        n += 1
+        while d.pending_events():
+            d.next_event()
+        time.sleep(max(0.0, start + n * period - time.monotonic()))
+    pump(2.5)
+    counts = sim_counts(m)
+    check(len(counts) >= 3, f"pacing: the simulated panel reported ({len(counts)} reports)")
+    if len(counts) < 3:
+        return
+    (s0, c0), (s1, c1) = counts[0], counts[-2]
+    shown, commits = s1 - s0, c1 - c0
+    print(f"pacing: {shown} frames shown of {commits} commits ({n} draws)", flush=True)
+    check(commits > 200, f"pacing: the window's frames reach gamescope ({commits} commits)")
+    # Before the fix about 79% were shown here. Not all of them can be:
+    # Xwayland's commits follow the headless main output's own 60 Hz, which
+    # now and then puts two in one panel refresh, and lavapipe takes ~6 ms
+    # a frame on the CPU (about 92% shown; an Adreno takes ~1 ms).
+    check(shown >= 0.86 * commits, f"pacing: nearly every commit is shown ({shown} of {commits})")
+
+
 def read_png(path):
     """RGBA rows of an 8-bit, non-interlaced PNG (as stb_image_write makes)."""
     import struct, zlib

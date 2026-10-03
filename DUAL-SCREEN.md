@@ -106,11 +106,13 @@ first lease commit is the place to start. PB-OS builds this branch as is.
 `GAMESCOPE_BOTTOM_SCREEN_SIMULATE=WIDTHxHEIGHT[@ROTATION]` (rotation in
 steps of 90°, 0-3, as the main output's) stands in for the leased panel on any
 backend, headless included: windows are picked, focus is kept and frames
-are drawn exactly as for the real panel, only not scanned out. With
+are drawn exactly as for the real panel, only not scanned out; each frame
+waits for the next refresh of a 60 Hz clock of its own, as on the panel, and
+every 2 s the log says how many of the window's commits were shown. With
 `GAMESCOPE_BOTTOM_SCREEN_SIMULATE_PNG=<path>` the newest frame is saved
 there twice a second. `tests/dual-screen/` uses it, with
-`bottom_screen_touch`, to check the window rules, focus, drawing, touch and
-yielding under a headless gamescope.
+`bottom_screen_touch`, to check the window rules, focus, drawing, touch,
+yielding and frame pacing under a headless gamescope.
 
 ## Planned
 

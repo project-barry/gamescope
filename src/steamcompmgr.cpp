@@ -10395,6 +10395,13 @@ namespace
 
 		const std::optional<Simulated> m_oSimulated = ParseSimulated();
 		uint64_t m_ulLastPng = 0;
+		// Simulated panel: its refresh clock, and frames shown out of the
+		// window's commits, logged every 2 s for the tests.
+		uint64_t m_ulSimVblank0 = 0;
+		uint64_t m_ulSimLoggedAt = 0;
+		uint64_t m_ulSimLastSeenCommitID = 0;
+		std::atomic<uint32_t> m_uSimCommits = { 0 };
+		uint32_t m_uSimShown = 0;
 		std::optional<BottomScreenTouchTarget> m_oTouchTarget;
 		bool m_bRaisedForTouch = false;
 		uint64_t m_ulResizedAt = 0;
@@ -10453,9 +10460,22 @@ namespace
 	{
 		if ( !m_oSimulated )
 			return drm_bottom_screen_present( job.uFbId );
-		// Paced like a 60 Hz panel.
-		std::this_thread::sleep_for( std::chrono::milliseconds( 16 ) );
-		const uint64_t ulNow = get_time_in_nanos();
+		// Paced like a 60 Hz panel: shown at its next refresh, which keeps
+		// its own clock.
+		constexpr uint64_t k_ulPeriod = 16'666'667;
+		uint64_t ulNow = get_time_in_nanos();
+		if ( !m_ulSimVblank0 )
+			m_ulSimVblank0 = m_ulSimLoggedAt = ulNow;
+		const uint64_t ulVblank = m_ulSimVblank0 + ( ( ulNow - m_ulSimVblank0 ) / k_ulPeriod + 1 ) * k_ulPeriod;
+		std::this_thread::sleep_for( std::chrono::nanoseconds( ulVblank - ulNow ) );
+		ulNow = get_time_in_nanos();
+		m_uSimShown++;
+		if ( ulNow - m_ulSimLoggedAt >= 2'000'000'000ul )
+		{
+			m_ulSimLoggedAt = ulNow;
+			xwm_log.infof( "bottom-screen: the simulated panel showed %u frames of %u commits",
+				m_uSimShown, m_uSimCommits.load() );
+		}
 		if ( !m_oSimulated->sPng.empty() && ulNow - m_ulLastPng >= 500'000'000ul )
 		{
 			m_ulLastPng = ulNow;
@@ -10610,6 +10630,11 @@ namespace
 				m_bBusy = false;
 			}
 			m_Cv.notify_all();
+			// A commit that came while this one waited for the panel was
+			// left for the next tick: have it now, not with the commit
+			// after it (which, with the panel and the app a frame apart,
+			// halved the frame rate and added a frame of lag).
+			nudge_steamcompmgr();
 		}
 	}
 
@@ -10799,6 +10824,11 @@ namespace
 		commit_t *pCommit = get_window_last_done_commit_peek( w );
 		if ( !pCommit || pCommit->commitID == m_ulLastCommitID )
 			return;
+		if ( m_oSimulated && pCommit->commitID != m_ulSimLastSeenCommitID )
+		{
+			m_ulSimLastSeenCommitID = pCommit->commitID;
+			m_uSimCommits++;
+		}
 
 		int nImage;
 		{
