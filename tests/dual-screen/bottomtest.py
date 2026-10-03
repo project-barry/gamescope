@@ -198,6 +198,14 @@ def scenario_azahar():
     pump(1.5)
     check(shown_last(m) == second.id, "Azahar: the Secondary Window is shown on the bottom screen")
     check(focused() == main.id, "Azahar: focus stays on the main window")
+    # Lime3DS and Citra, Azahar's forebears, title it the same way.
+    second.unmap()
+    pump(1.0)
+    m = mark()
+    lime = Win("Lime3DS 2119.1 | Mario Kart 7 | Secondary Window", GREEN, (320, 240))
+    lime.map()
+    pump(1.5)
+    check(shown_last(m) == lime.id, "Azahar: Lime3DS's Secondary Window too")
 
 
 def scenario_cemu():
