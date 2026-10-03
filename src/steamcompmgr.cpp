@@ -5182,12 +5182,22 @@ void xwayland_ctx_t::DetermineAndApplyFocus( const std::vector< steamcompmgr_win
 	// X routes input by stacking, and only mapped windows take part. GTK4 keeps
 	// its unmapped popups stacked above their parent, so raising over one of
 	// those just trades ConfigureNotify events with the client forever.
+	// The bottom screen's window stays above them all (below): it is not
+	// one to raise over.
 	size_t nWindowCount = 0;
 	steamcompmgr_win_t *pFirstMapped = nullptr;
+	steamcompmgr_win_t *pBottomScreenWindow = nullptr;
 	for ( steamcompmgr_win_t *pWindow = ctx->list; pWindow; pWindow = pWindow->xwayland().next )
 	{
 		++nWindowCount;
-		if ( !pFirstMapped && pWindow->xwayland().a.map_state == IsViewable )
+		if ( pWindow->xwayland().a.map_state != IsViewable )
+			continue;
+		if ( bottom_screen_shows( pWindow ) )
+		{
+			pBottomScreenWindow = pWindow;
+			continue;
+		}
+		if ( !pFirstMapped )
 			pFirstMapped = pWindow;
 	}
 
@@ -5218,7 +5228,8 @@ void xwayland_ctx_t::DetermineAndApplyFocus( const std::vector< steamcompmgr_win
 		bool bSeenBase = false;
 		for ( steamcompmgr_win_t *pWindow = ctx->list; !bNeedsRestack && pWindow; pWindow = pWindow->xwayland().next )
 		{
-			if ( pWindow->xwayland().a.map_state != IsViewable || pWindow == inputFocus )
+			if ( pWindow->xwayland().a.map_state != IsViewable || pWindow == inputFocus ||
+				 pWindow == pBottomScreenWindow )
 				continue;
 			if ( pWindow == mouseBaseWindow )
 				bSeenBase = true;
@@ -5242,6 +5253,15 @@ void xwayland_ctx_t::DetermineAndApplyFocus( const std::vector< steamcompmgr_win
 	}
 	else if ( pFirstMapped != inputFocus )
 		inputFocus->Raise();
+
+	// Xwayland gives a touch to the window on top where it lands, and both
+	// of an emulator's windows cover the same place: kept above the window
+	// raised for focus, the bottom screen's window gets every touch of its
+	// panel. Raising it only when a touch went down lost about one in six
+	// to the app's other window when a focus pass raised that one around
+	// the touch (Azahar on an AYN Thor). Focus does not follow stacking.
+	if ( pBottomScreenWindow && ctx->list != pBottomScreenWindow )
+		pBottomScreenWindow->Raise();
 
 	wlserver_lock();
 	bool bDragging = wlserver.drag_anchor.surface && wlserver.drag_anchor.surface == w->main_surface();
@@ -10604,6 +10624,7 @@ namespace
 		void PresentThread();
 		void SetTouchTarget( const BottomScreenTouchTarget *pTarget );
 		void HandleTouches( steamcompmgr_win_t *w );
+		void TraceTouchStacking( steamcompmgr_win_t *w );
 		bool PanelAcquire( BottomScreenInfo *pInfo );
 		bool PanelPresent( const BottomScreenJob &job );
 		void PanelRelease();
@@ -10623,6 +10644,7 @@ namespace
 		uint32_t m_uSimShown = 0;
 		std::optional<BottomScreenTouchTarget> m_oTouchTarget;
 		bool m_bRaisedForTouch = false;
+		uint64_t m_ulRaisedAt = 0;
 		uint64_t m_ulResizedAt = 0;
 		EShowing m_ePublishedShowing = EShowing::Absent;
 
@@ -10795,6 +10817,8 @@ namespace
 			w->Raise();
 			XSync( w->xwayland().ctx->dpy, False );
 			m_bRaisedForTouch = true;
+			if ( CBottomScreenTrace::Enabled() )
+				TraceTouchStacking( w );
 		}
 		wlserver_lock();
 		const bool bDown = wlserver_bottom_screen_touch_flush();
@@ -10804,6 +10828,35 @@ namespace
 			m_bRaisedForTouch = false;
 			MakeFocusDirty();
 		}
+	}
+
+	// GAMESCOPE_BOTTOM_SCREEN_TRACE: as a touch goes to the window, the
+	// mapped windows X has above it (it should have none).
+	void CBottomScreen::TraceTouchStacking( steamcompmgr_win_t *w )
+	{
+		xwayland_ctx_t *ctx = w->xwayland().ctx;
+		Window root = 0, parent = 0, *pChildren = nullptr;
+		unsigned int uCount = 0;
+		if ( !XQueryTree( ctx->dpy, ctx->root, &root, &parent, &pChildren, &uCount ) )
+			return;
+		std::string sAbove;
+		// Bottom to top.
+		bool bSeen = false;
+		for ( unsigned int i = 0; i < uCount; i++ )
+		{
+			if ( pChildren[ i ] == w->xwayland().id )
+			{
+				bSeen = true;
+				continue;
+			}
+			steamcompmgr_win_t *pOther = bSeen ? find_win( ctx, pChildren[ i ], false ) : nullptr;
+			if ( pOther && pOther->xwayland().a.map_state == IsViewable )
+				sAbove += std::string( sAbove.empty() ? "" : ", " ) + "\"" + pOther->debug_name() + "\"";
+		}
+		if ( pChildren )
+			XFree( pChildren );
+		xwm_log.infof( "bottom-screen trace: touch down, %s", sAbove.empty() ? "window on top" :
+			( "UNDER " + sAbove ).c_str() );
 	}
 
 	steamcompmgr_win_t *CBottomScreen::FindWindow()
@@ -11044,6 +11097,21 @@ namespace
 			{
 				m_ulResizedAt = ulNow;
 				XResizeWindow( ctx->dpy, w->xwayland().id, uWidth, uHeight );
+			}
+		}
+
+		// Above every other mapped window, where X sends its touches (see
+		// the focus pass): an app restacking its own windows puts it back
+		// under. At most every 100 ms, for one that keeps doing so.
+		{
+			steamcompmgr_win_t *pTop = w->xwayland().ctx->list;
+			while ( pTop && pTop->xwayland().a.map_state != IsViewable )
+				pTop = pTop->xwayland().next;
+			const uint64_t ulNow = get_time_in_nanos();
+			if ( pTop != w && ulNow - m_ulRaisedAt >= 100'000'000ul )
+			{
+				m_ulRaisedAt = ulNow;
+				w->Raise();
 			}
 		}
 

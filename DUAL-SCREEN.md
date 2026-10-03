@@ -71,8 +71,10 @@ first lease commit is the place to start. PB-OS builds this branch as is.
    holder. They arrive as touches (XI 2.2 touch events for X11 apps;
    gamescope starts Xwayland with `-noTouchPointerEmulation`), as Qt apps
    such as melonDS and Azahar take them. X hands a touch to the topmost
-   window at its point, so the window is raised under the game while a
-   touch starts and the game is raised again once no touch is down.
+   window at its point, so the window is kept above every other X window,
+   the game's too, even when the game raises itself; focus stays with the
+   game. A mouse pointer over the top screen where the window lies reaches
+   the window, not the game.
    Touches on the black bars beside the window go nowhere.
    `gamescopectl bottom_screen_touch "down|motion|up ID X Y"` feeds such a
    touch by hand (X, Y normalized as the panel scans out).

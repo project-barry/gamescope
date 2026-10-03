@@ -301,7 +301,21 @@ def scenario_touch():
     check(not touch_events(n, main.id), "touch: the main window gets none of it")
     check(focused() == main.id, "touch: focus stays on the main window")
     stack = [c.id for c in root.query_tree().children if c.id in (main.id, second.id)]
-    check(stack[-1:] == [main.id], f"touch: the game is the topmost X window again after the touch (stack {stack})")
+    check(stack[-1:] == [second.id], f"touch: the bottom screen's window stays the topmost X window (stack {stack})")
+
+    # The game raising itself (Qt does on activation) does not take the
+    # next touch: one in six went to Azahar's main window on an AYN Thor.
+    main.w.configure(stack_mode=X.Above)
+    d.flush()
+    pump(0.5)
+    n = len(TOUCH)
+    touch("down", 2, *panel_point(second.size, 100, 80))
+    pump(0.3)
+    touch("up", 2)
+    pump(0.4)
+    check(len([e for e in touch_events(n, second.id) if e[0] == "begin"]) == 1 and not touch_events(n, main.id),
+          f"touch: after the game raises itself, a touch still reaches the window (got {touch_events(n)})")
+    check(focused() == main.id, "touch: and focus stays on the main window")
 
     # Two fingers at once each reach the window.
     n = len(TOUCH)
