@@ -4903,6 +4903,7 @@ found:;
 }
 
 static bool bottom_screen_shows( const steamcompmgr_win_t *w );
+static bool bottom_screen_shows_app_of( const steamcompmgr_win_t *w );
 
  std::vector< steamcompmgr_win_t* > xwayland_ctx_t::GetPossibleFocusWindows()
  {
@@ -10581,6 +10582,11 @@ namespace
 		void Tick();
 		// Shown, or kept for the panel while it is yielded.
 		bool Shows( const steamcompmgr_win_t *w ) const { return ( m_bHeld || m_bYielded ) && w == m_pShown; }
+		// Another window of the app whose window is shown.
+		bool ShowsAppOf( const steamcompmgr_win_t *w ) const
+		{
+			return ( m_bHeld || m_bYielded ) && w != m_pShown && m_nShownPid > 0 && w->pid == m_nShownPid;
+		}
 
 	private:
 		struct Simulated
@@ -10628,6 +10634,7 @@ namespace
 		bool m_bYielded = false;
 		// Compared only, never followed: FindWindow renews it every tick.
 		const steamcompmgr_win_t *m_pShown = nullptr;
+		pid_t m_nShownPid = -1;
 		uint64_t m_ulRetryAt = 0;
 		BottomScreenInfo m_Info = {};
 		gamescope::Rc<CVulkanTexture> m_pImages[ k_nImages ];
@@ -10916,6 +10923,7 @@ namespace
 		if ( !bYield )
 		{
 			m_pShown = nullptr;
+			m_nShownPid = -1;
 			MakeFocusDirty();
 		}
 		m_ulLastCommitID = 0;
@@ -10934,6 +10942,7 @@ namespace
 			{
 				m_bYielded = false;
 				m_pShown = nullptr;
+				m_nShownPid = -1;
 				MakeFocusDirty();
 				PublishShowing( EShowing::Absent );
 			}
@@ -10953,6 +10962,7 @@ namespace
 			{
 				m_bYielded = true;
 				m_pShown = w;
+				m_nShownPid = w->pid;
 				MakeFocusDirty();
 				PublishShowing( EShowing::Waiting );
 			}
@@ -10987,6 +10997,7 @@ namespace
 			m_bHeld = true;
 			m_bYielded = false; // the window was kept out of focus meanwhile
 			m_pShown = nullptr;
+			m_nShownPid = -1;
 			m_ulLastCommitID = 0;
 			if ( !m_bThreadStarted )
 			{
@@ -11002,6 +11013,7 @@ namespace
 				w->isBottomScreen ? "property" : "title" );
 			// Leaves focus, or gets it back, from here on.
 			m_pShown = w;
+			m_nShownPid = w->pid;
 			PublishShowing( EShowing::Shown );
 			m_ulLastCommitID = 0;
 			MakeFocusDirty();
@@ -11139,6 +11151,11 @@ namespace
 static bool bottom_screen_shows( const steamcompmgr_win_t *w )
 {
 	return BottomScreen().Shows( w );
+}
+
+static bool bottom_screen_shows_app_of( const steamcompmgr_win_t *w )
+{
+	return BottomScreen().ShowsAppOf( w );
 }
 
 void
@@ -11713,10 +11730,22 @@ steamcompmgr_main(int argc, char **argv)
 				// pair overran a 60 Hz frame (Azahar: ~55 fps with two
 				// screens on an AYN Thor, 60 with one). At most every 4 ms,
 				// for an app that draws only when asked.
+				// The same app's windows here are asked as soon as their
+				// frame is taken too: waiting for this output's vblank left
+				// the emulator too little of a refresh for its next frame
+				// with two windows to draw, and it slowed to ~55 fps, its
+				// audio with it. GAMESCOPE_BOTTOM_SCREEN_APP_VBLANK=1 keeps
+				// them on vblanks.
+				static const bool s_bAppVblank = []
+				{
+					const char *p = getenv( "GAMESCOPE_BOTTOM_SCREEN_APP_VBLANK" );
+					return p && *p && strcmp( p, "0" ) != 0;
+				}();
 				const uint64_t ulNow = get_time_in_nanos();
 				for (steamcompmgr_win_t *w = server->ctx->list; w; w = w->xwayland().next)
 				{
-					if ( w->receivedDoneCommit && bottom_screen_shows( w ) &&
+					if ( w->receivedDoneCommit &&
+						 ( bottom_screen_shows( w ) || ( !s_bAppVblank && bottom_screen_shows_app_of( w ) ) ) &&
 						 ulNow - w->last_commit_first_latch_time >= 4'000'000ul )
 					{
 						w->unlockedForFrameCallback = true;
