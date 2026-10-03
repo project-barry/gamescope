@@ -53,6 +53,7 @@ int drm_lease_dup_fd();
 int drm_lease_open_enum_fd();
 const char *drm_lease_connector_name();
 uint32_t drm_lease_connector_id();
+void drm_lease_blank();
 
 enum class DrmLeaseEventType : uint32_t
 {

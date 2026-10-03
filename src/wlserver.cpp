@@ -1559,6 +1559,8 @@ static void drm_lease_resource_destroyed( struct wl_resource *resource )
 	{
 		g_nProtocolLeaseHolders.fetch_sub( 1 );
 		int nRemaining = g_nActiveLeaseClients.fetch_sub( 1 ) - 1;
+		if ( nRemaining == 0 )
+			drm_lease_blank();
 		grantLock.unlock();
 		wl_log.infof( "drm-lease: protocol lease released (%d holders remain)", nRemaining );
 	}
