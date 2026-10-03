@@ -235,6 +235,7 @@ struct xwayland_ctx_t final : public gamescope::IWaitable
 
 		Atom gamescopeForceWindowsFullscreen;
 		Atom gamescopeFocusBottomInset;
+		Atom gamescopeBottomScreen;
 
 		Atom gamescopeColorLut3DOverride;
 		Atom gamescopeColorShaperLutOverride;

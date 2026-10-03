@@ -181,6 +181,11 @@ struct drm_t {
 	int nLeaseSocketFd = -1;
 	std::atomic<bool> bLeaseThreadRunning = { false };
 	std::string sLeaseSocketPath;
+	// The leased objects themselves, for drawing on the panel here
+	// (drm_bottom_screen_*): the lessor keeps access to what it leases.
+	gamescope::CDRMConnector *pLeaseConnector = nullptr;
+	gamescope::CDRMCRTC *pLeaseCRTC = nullptr;
+	gamescope::CDRMPlane *pLeasePlane = nullptr;
 };
 
 void drm_drop_fbid( struct drm_t *drm, uint32_t fbid );
@@ -2138,6 +2143,9 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
 					drm->nLeaseFd = nLeaseFd;
 					drm->uLeasedConnectorId = uConnectorId;
 					drm->sLeasedConnectorName = pLeaseConnector->GetName();
+					drm->pLeaseConnector = pLeaseConnector;
+					drm->pLeaseCRTC = pLeaseCRTC;
+					drm->pLeasePlane = pLeasePlane;
 					drm->leaseBlankProperties = {{
 						{ uConnectorId, pLeaseConnector->GetProperties().CRTC_ID->GetPropertyId() },
 						{ uCRTCId, pLeaseCRTC->GetProperties().ACTIVE->GetPropertyId() },
@@ -4616,6 +4624,196 @@ void drm_lease_blank()
 	}
 
 	drm_log.infof( "lease-connector: blanked '%s'", g_DRM.sLeasedConnectorName.c_str() );
+}
+
+// The leased panel, drawn by this gamescope for a window that asks for it
+// (GAMESCOPE_BOTTOM_SCREEN), the AYN Thor's bottom screen. It is taken from
+// the lease holders the way a drm-lease-v1 client takes it: a yielding
+// companion (Barry Launcher's gamescope) is suspended and counted as a
+// protocol holder, so no other client gets the lease meanwhile; released, the
+// companion resumes and sets its own mode again. Commits go through the
+// lessor's fd, which keeps access to everything it leased.
+static struct
+{
+	bool bHeld = false;
+	bool bModeSet = false;
+	uint32_t uModeBlob = 0;
+	drmModeModeInfo mode = {};
+} s_BottomScreen;
+
+static uint32_t bottom_screen_rotation( const drmModeModeInfo &mode )
+{
+	// GAMESCOPE_BOTTOM_SCREEN_ORIENTATION: normal, left, right or upsidedown,
+	// as --force-orientation; otherwise the panel's own, as the main output.
+	const char *pszOrientation = getenv( "GAMESCOPE_BOTTOM_SCREEN_ORIENTATION" );
+	GamescopePanelOrientation eOrientation = GAMESCOPE_PANEL_ORIENTATION_AUTO;
+	if ( pszOrientation && pszOrientation[0] )
+	{
+		if ( !strcmp( pszOrientation, "normal" ) ) eOrientation = GAMESCOPE_PANEL_ORIENTATION_0;
+		else if ( !strcmp( pszOrientation, "left" ) ) eOrientation = GAMESCOPE_PANEL_ORIENTATION_90;
+		else if ( !strcmp( pszOrientation, "right" ) ) eOrientation = GAMESCOPE_PANEL_ORIENTATION_270;
+		else if ( !strcmp( pszOrientation, "upsidedown" ) ) eOrientation = GAMESCOPE_PANEL_ORIENTATION_180;
+	}
+	if ( eOrientation == GAMESCOPE_PANEL_ORIENTATION_AUTO )
+	{
+		g_DRM.pLeaseConnector->UpdateEffectiveOrientation( &mode );
+		eOrientation = g_DRM.pLeaseConnector->GetCurrentOrientation();
+	}
+	switch ( eOrientation )
+	{
+		case GAMESCOPE_PANEL_ORIENTATION_90: return 1u;
+		case GAMESCOPE_PANEL_ORIENTATION_180: return 2u;
+		case GAMESCOPE_PANEL_ORIENTATION_270: return 3u;
+		default: return 0u;
+	}
+}
+
+bool drm_bottom_screen_acquire( BottomScreenInfo *pInfo )
+{
+	if ( s_BottomScreen.bHeld )
+		return true;
+	if ( g_DRM.nLeaseFd < 0 || !g_DRM.pLeaseConnector || !g_DRM.pLeaseCRTC || !g_DRM.pLeasePlane )
+		return false;
+
+	const drmModeConnector *pModeConnector = g_DRM.pLeaseConnector->GetModeConnector();
+	if ( !pModeConnector || pModeConnector->count_modes <= 0 )
+		return false;
+	drmModeModeInfo mode = pModeConnector->modes[ 0 ];
+	for ( int i = 0; i < pModeConnector->count_modes; i++ )
+	{
+		if ( pModeConnector->modes[ i ].type & DRM_MODE_TYPE_PREFERRED )
+		{
+			mode = pModeConnector->modes[ i ];
+			break;
+		}
+	}
+
+	{
+		std::unique_lock<std::mutex> grantLock( g_LeaseGrantMutex );
+		bool bFree = g_nActiveLeaseClients.load() == 0;
+		if ( !bFree && g_nProtocolLeaseHolders.load() == 0 )
+		{
+			grantLock.unlock();
+			bFree = drm_lease_companion_suspend( 500 );
+			grantLock.lock();
+			// A companion may have come or gone while the lock was dropped.
+			bFree = bFree && g_nProtocolLeaseHolders.load() == 0 && !drm_lease_companion_active();
+		}
+		if ( !bFree )
+		{
+			drm_log.infof( "bottom-screen: the lease is held elsewhere" );
+			return false;
+		}
+		g_nActiveLeaseClients.fetch_add( 1 );
+		g_nProtocolLeaseHolders.fetch_add( 1 );
+	}
+
+	uint32_t uBlob = 0;
+	if ( drmModeCreatePropertyBlob( g_DRM.fd, &mode, sizeof( mode ), &uBlob ) != 0 )
+	{
+		drm_log.errorf_errno( "bottom-screen: cannot create a mode blob" );
+		drm_bottom_screen_release();
+		return false;
+	}
+
+	s_BottomScreen.bHeld = true;
+	s_BottomScreen.bModeSet = false;
+	s_BottomScreen.uModeBlob = uBlob;
+	s_BottomScreen.mode = mode;
+
+	pInfo->uWidth = mode.hdisplay;
+	pInfo->uHeight = mode.vdisplay;
+	pInfo->uRotation = bottom_screen_rotation( mode );
+	drm_log.infof( "bottom-screen: took '%s' (%ux%u@%u, rotation %u)",
+		g_DRM.sLeasedConnectorName.c_str(), mode.hdisplay, mode.vdisplay, mode.vrefresh, pInfo->uRotation );
+	return true;
+}
+
+bool drm_bottom_screen_present( uint32_t uFbId )
+{
+	if ( !s_BottomScreen.bHeld )
+		return false;
+
+	drmModeAtomicReq *pRequest = drmModeAtomicAlloc();
+	if ( !pRequest )
+		return false;
+	defer( drmModeAtomicFree( pRequest ) );
+
+	auto &connector = g_DRM.pLeaseConnector->GetProperties();
+	auto &crtc = g_DRM.pLeaseCRTC->GetProperties();
+	auto &plane = g_DRM.pLeasePlane->GetProperties();
+	const uint32_t uCRTC = g_DRM.pLeaseCRTC->GetObjectId();
+	const uint32_t uPlane = g_DRM.pLeasePlane->GetObjectId();
+	const uint64_t ulW = s_BottomScreen.mode.hdisplay, ulH = s_BottomScreen.mode.vdisplay;
+
+	bool bOk = true;
+	auto add = [&]( uint32_t uObject, const std::optional<gamescope::CDRMAtomicProperty> &prop, uint64_t ulValue )
+	{
+		if ( !prop || drmModeAtomicAddProperty( pRequest, uObject, prop->GetPropertyId(), ulValue ) < 0 )
+			bOk = false;
+	};
+
+	uint32_t uFlags = 0;
+	if ( !s_BottomScreen.bModeSet )
+	{
+		add( g_DRM.pLeaseConnector->GetObjectId(), connector.CRTC_ID, uCRTC );
+		add( uCRTC, crtc.MODE_ID, s_BottomScreen.uModeBlob );
+		add( uCRTC, crtc.ACTIVE, 1 );
+		uFlags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
+	}
+	add( uPlane, plane.FB_ID, uFbId );
+	add( uPlane, plane.CRTC_ID, uCRTC );
+	add( uPlane, plane.SRC_X, 0 );
+	add( uPlane, plane.SRC_Y, 0 );
+	add( uPlane, plane.SRC_W, ulW << 16 );
+	add( uPlane, plane.SRC_H, ulH << 16 );
+	add( uPlane, plane.CRTC_X, 0 );
+	add( uPlane, plane.CRTC_Y, 0 );
+	add( uPlane, plane.CRTC_W, ulW );
+	add( uPlane, plane.CRTC_H, ulH );
+	if ( !bOk )
+	{
+		drm_log.errorf( "bottom-screen: cannot build the commit" );
+		return false;
+	}
+
+	// Blocking: the caller's thread is paced by the panel.
+	if ( drmModeAtomicCommit( g_DRM.fd, pRequest, uFlags, nullptr ) != 0 )
+	{
+		drm_log.errorf_errno( "bottom-screen: commit failed" );
+		return false;
+	}
+	if ( !s_BottomScreen.bModeSet )
+		drm_log.infof( "bottom-screen: showing on '%s'", g_DRM.sLeasedConnectorName.c_str() );
+	s_BottomScreen.bModeSet = true;
+	return true;
+}
+
+uint32_t drm_bottom_screen_fb_id( gamescope::IBackendFb *pFb )
+{
+	return pFb ? static_cast<gamescope::CDRMFb *>( pFb )->GetFbId() : 0;
+}
+
+void drm_bottom_screen_release()
+{
+	if ( s_BottomScreen.uModeBlob )
+	{
+		drmModeDestroyPropertyBlob( g_DRM.fd, s_BottomScreen.uModeBlob );
+		s_BottomScreen.uModeBlob = 0;
+	}
+	s_BottomScreen.bHeld = false;
+	s_BottomScreen.bModeSet = false;
+
+	std::unique_lock<std::mutex> grantLock( g_LeaseGrantMutex );
+	g_nProtocolLeaseHolders.fetch_sub( 1 );
+	const int nRemaining = g_nActiveLeaseClients.fetch_sub( 1 ) - 1;
+	if ( nRemaining == 0 )
+		drm_lease_blank();
+	const bool bLastProtocolHolder = g_nProtocolLeaseHolders.load() == 0;
+	grantLock.unlock();
+	drm_log.infof( "bottom-screen: gave '%s' back", g_DRM.sLeasedConnectorName.c_str() );
+	if ( bLastProtocolHolder )
+		drm_lease_companion_resume();
 }
 
 uint32_t drm_lease_connector_id()

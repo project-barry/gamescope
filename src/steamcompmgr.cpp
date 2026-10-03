@@ -4907,8 +4907,9 @@ found:;
 
 	for (steamcompmgr_win_t *w = this->list; w; w = w->xwayland().next)
 	{
-		// Always skip system tray icons and overlays
-		if ( w->isSysTrayIcon || w->isOverlay || w->isExternalOverlay )
+		// Always skip system tray icons and overlays, and what the bottom
+		// screen shows
+		if ( w->isSysTrayIcon || w->isOverlay || w->isExternalOverlay || w->isBottomScreen )
 		{
 			continue;
 		}
@@ -6240,6 +6241,7 @@ map_win(xwayland_ctx_t* ctx, Window id, unsigned long sequence)
 	
 	w->isOverlay = get_prop(ctx, w->xwayland().id, ctx->atoms.overlayAtom, 0);
 	w->isExternalOverlay = get_prop(ctx, w->xwayland().id, ctx->atoms.externalOverlayAtom, 0, &w->bHasExternalOverlayProp);
+	w->isBottomScreen = !!get_prop(ctx, w->xwayland().id, ctx->atoms.gamescopeBottomScreen, 0);
 	w->uMangoappMsgType = get_prop(ctx, w->xwayland().id, ctx->atoms.mangoappMsgTypeAtom, 0);
 
 	// misyl: Disable appID for overlay types, as parts of the code don't expect that focus-wise.
@@ -7440,6 +7442,16 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 				w->appID = 0;
 
 			MakeFocusDirty();
+		}
+	}
+	if (ev->atom == ctx->atoms.gamescopeBottomScreen)
+	{
+		steamcompmgr_win_t * w = find_win(ctx, ev->window);
+		if (w)
+		{
+			w->isBottomScreen = !!get_prop(ctx, w->xwayland().id, ctx->atoms.gamescopeBottomScreen, 0);
+			MakeFocusDirty();
+			hasRepaint = true;
 		}
 	}
 	if (ev->atom == ctx->atoms.overlayAtom)
@@ -9485,6 +9497,7 @@ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_
 
 	ctx->atoms.gamescopeForceWindowsFullscreen = XInternAtom( ctx->dpy, "GAMESCOPE_FORCE_WINDOWS_FULLSCREEN", false );
 	ctx->atoms.gamescopeFocusBottomInset = XInternAtom( ctx->dpy, "GAMESCOPE_FOCUS_BOTTOM_INSET", false );
+	ctx->atoms.gamescopeBottomScreen = XInternAtom( ctx->dpy, "GAMESCOPE_BOTTOM_SCREEN", false );
 
 	ctx->atoms.gamescopeColorLut3DOverride = XInternAtom( ctx->dpy, "GAMESCOPE_COLOR_3DLUT_OVERRIDE", false );
 	ctx->atoms.gamescopeColorShaperLutOverride = XInternAtom( ctx->dpy, "GAMESCOPE_COLOR_SHAPERLUT_OVERRIDE", false );
@@ -10276,6 +10289,212 @@ static void relay_mangoapp_control()
 		s_bMangoappLogging = *relay.obLogging;
 	else if ( relay.bToggleLogging )
 		s_bMangoappLogging = !s_bMangoappLogging;
+}
+
+// The bottom screen (the AYN Thor's, leased to Barry Launcher's gamescope):
+// a window with GAMESCOPE_BOTTOM_SCREEN set is drawn there, fitted and
+// turned like the panel, while the main output and focus leave it out. The
+// panel is taken from the lease's holder while such a window is mapped, and
+// given back when none is. Drawing happens here on the compositor thread;
+// scanning out, which blocks until the panel shows the frame, on its own.
+namespace
+{
+	struct BottomScreenJob
+	{
+		uint64_t ulSeqNo;
+		uint32_t uFbId;
+		int nImage;
+	};
+
+	class CBottomScreen
+	{
+	public:
+		void Tick();
+
+	private:
+		steamcompmgr_win_t *FindWindow();
+		void Release();
+		void PresentThread();
+
+		static constexpr int k_nImages = 3;
+
+		bool m_bHeld = false;
+		uint64_t m_ulRetryAt = 0;
+		BottomScreenInfo m_Info = {};
+		gamescope::Rc<CVulkanTexture> m_pImages[ k_nImages ];
+		uint64_t m_ulLastCommitID = 0;
+		int m_nNextImage = 0;
+
+		bool m_bThreadStarted = false;
+		std::mutex m_Mutex;
+		std::condition_variable m_Cv;
+		std::optional<BottomScreenJob> m_oJob;
+		bool m_bBusy = false;
+		int m_nOnScreen = -1;
+	};
+
+	steamcompmgr_win_t *CBottomScreen::FindWindow()
+	{
+		gamescope_xwayland_server_t *server = nullptr;
+		for ( size_t i = 0; ( server = wlserver_get_xwayland_server( i ) ); i++ )
+		{
+			for ( steamcompmgr_win_t *w = server->ctx->list; w; w = w->xwayland().next )
+			{
+				if ( w->isBottomScreen && w->xwayland().a.map_state == IsViewable &&
+					 get_window_last_done_commit_peek( w ) )
+					return w;
+			}
+		}
+		return nullptr;
+	}
+
+	void CBottomScreen::PresentThread()
+	{
+		pthread_setname_np( pthread_self(), "gs-bottom" );
+		for ( ;; )
+		{
+			BottomScreenJob job;
+			{
+				std::unique_lock lock( m_Mutex );
+				m_Cv.wait( lock, [&] { return m_oJob.has_value(); } );
+				job = *m_oJob;
+			}
+			// The frame is scanned out once the GPU has drawn it.
+			while ( vulkan_completed_seq() < job.ulSeqNo )
+				std::this_thread::sleep_for( std::chrono::microseconds( 500 ) );
+			const bool bShown = drm_bottom_screen_present( job.uFbId );
+			{
+				std::unique_lock lock( m_Mutex );
+				if ( bShown )
+					m_nOnScreen = job.nImage;
+				m_oJob.reset();
+				m_bBusy = false;
+			}
+			m_Cv.notify_all();
+		}
+	}
+
+	void CBottomScreen::Release()
+	{
+		{
+			std::unique_lock lock( m_Mutex );
+			m_Cv.wait( lock, [&] { return !m_bBusy; } );
+			m_nOnScreen = -1;
+		}
+		drm_bottom_screen_release();
+		m_bHeld = false;
+		m_ulLastCommitID = 0;
+		// The images stay: the panel may scan one out until the lease's
+		// holder has set its own again.
+	}
+
+	void CBottomScreen::Tick()
+	{
+		steamcompmgr_win_t *w = FindWindow();
+		if ( !w )
+		{
+			if ( m_bHeld )
+				Release();
+			return;
+		}
+
+		if ( !m_bHeld )
+		{
+			const uint64_t ulNow = get_time_in_nanos();
+			if ( ulNow < m_ulRetryAt )
+				return;
+			BottomScreenInfo info = {};
+			if ( !drm_bottom_screen_acquire( &info ) )
+			{
+				m_ulRetryAt = ulNow + 1'000'000'000ul;
+				return;
+			}
+			if ( !m_pImages[ 0 ] || info.uWidth != m_Info.uWidth || info.uHeight != m_Info.uHeight )
+			{
+				for ( auto &pImage : m_pImages )
+				{
+					pImage = vulkan_create_bottom_screen_image( info.uWidth, info.uHeight );
+					if ( !pImage )
+					{
+						drm_bottom_screen_release();
+						m_ulRetryAt = ulNow + 5'000'000'000ul;
+						return;
+					}
+				}
+			}
+			m_Info = info;
+			m_bHeld = true;
+			m_ulLastCommitID = 0;
+			if ( !m_bThreadStarted )
+			{
+				// Lives as long as the process, as this does.
+				std::thread( [this] { PresentThread(); } ).detach();
+				m_bThreadStarted = true;
+			}
+		}
+
+		commit_t *pCommit = get_window_last_done_commit_peek( w );
+		if ( !pCommit || pCommit->commitID == m_ulLastCommitID )
+			return;
+
+		int nImage;
+		{
+			std::unique_lock lock( m_Mutex );
+			if ( m_bBusy )
+				return; // next tick; the newest commit then
+			nImage = m_nNextImage;
+			if ( nImage == m_nOnScreen )
+				nImage = ( nImage + 1 ) % k_nImages;
+			m_nNextImage = ( nImage + 1 ) % k_nImages;
+		}
+
+		gamescope::Rc<CVulkanTexture> pTex = pCommit->vulkanTex;
+		gamescope::IBackendFb *pFb = m_pImages[ nImage ]->GetBackendFb();
+		if ( !pTex || !pFb )
+			return;
+
+		// Fitted into the turned panel, centered, black around it.
+		float flLogicalWidth = m_Info.uWidth, flLogicalHeight = m_Info.uHeight;
+		if ( m_Info.uRotation & 1u )
+			std::swap( flLogicalWidth, flLogicalHeight );
+		const float flRatio = std::min( flLogicalWidth / pTex->width(), flLogicalHeight / pTex->height() );
+
+		struct FrameInfo_t frameInfo = {};
+		frameInfo.applyOutputColorMgmt = false;
+		frameInfo.outputEncodingEOTF = EOTF_Gamma22;
+		FrameInfo_t::Layer_t *layer = frameInfo.layers.push();
+		layer->tex = pTex;
+		layer->zpos = g_zposBase;
+		layer->scale = { 1.0f / flRatio, 1.0f / flRatio };
+		layer->offset = { -( flLogicalWidth - pTex->width() * flRatio ) / 2.0f,
+		                  -( flLogicalHeight - pTex->height() * flRatio ) / 2.0f };
+		layer->opacity = 1.0f;
+		layer->filter = GamescopeUpscaleFilter::LINEAR;
+		layer->blackBorder = true;
+		layer->applyColorMgmt = false;
+		layer->colorspace = pCommit->colorspace();
+		layer->eAlphaBlendingMode = ALPHA_BLENDING_MODE_PREMULTIPLIED;
+
+		std::optional<uint64_t> oSeqNo = vulkan_composite_bottom_screen( &frameInfo, m_pImages[ nImage ], m_Info.uRotation );
+		if ( !oSeqNo )
+			return;
+
+		m_ulLastCommitID = pCommit->commitID;
+		{
+			std::unique_lock lock( m_Mutex );
+			m_bBusy = true;
+			m_oJob = BottomScreenJob{ *oSeqNo, drm_bottom_screen_fb_id( pFb ), nImage };
+		}
+		m_Cv.notify_all();
+	}
+
+	// Never destroyed: its images must not outlive Vulkan at exit, and its
+	// thread runs until the process ends.
+	CBottomScreen &BottomScreen()
+	{
+		static CBottomScreen *s_pBottomScreen = new CBottomScreen;
+		return *s_pBottomScreen;
+	}
 }
 
 void
@@ -11150,6 +11369,8 @@ steamcompmgr_main(int argc, char **argv)
 				bPainted = true;
 			}
 		}
+
+		BottomScreen().Tick();
 
 		if ( vblank && g_bUpdateForwardedVROverlays )
 		{

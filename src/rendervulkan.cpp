@@ -4583,6 +4583,56 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	return sequence;
 }
 
+// The leased panel this gamescope draws a window on (the AYN Thor's bottom
+// screen, drm_bottom_screen_*): scanout images of the panel's own size.
+gamescope::Rc<CVulkanTexture> vulkan_create_bottom_screen_image( uint32_t uWidth, uint32_t uHeight )
+{
+	CVulkanTexture::createFlags flags;
+	flags.bFlippable = true;
+	flags.bStorage = true;
+	flags.bSampled = true;
+	flags.bOutputImage = true;
+
+	gamescope::Rc<CVulkanTexture> pImage = new CVulkanTexture();
+	if ( !pImage->BInit( uWidth, uHeight, 1u, g_output.uOutputFormat, flags ) )
+	{
+		vk_log.errorf( "failed to allocate a bottom screen image" );
+		return nullptr;
+	}
+	return pImage;
+}
+
+// Composites frameInfo's layers into pTarget, a bottom screen image, turned by
+// uRotation steps like the main output (the layers are laid out in the
+// turned, logical space). Plain blit, no output color management.
+std::optional<uint64_t> vulkan_composite_bottom_screen( const struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pTarget, uint32_t uRotation )
+{
+	auto cmdBuffer = g_device.commandBuffer();
+
+	for (uint32_t i = 0; i < EOTF_Count; i++)
+		cmdBuffer->bindColorMgmtLuts(i, nullptr, nullptr);
+
+	cmdBuffer->bindPipeline( g_device.pipeline(SHADER_TYPE_BLIT, frameInfo->layers.count(), frameInfo->ycbcrMask(), 0u, frameInfo->colorspaceMask(), EOTF_Count ));
+	bind_all_layers(cmdBuffer.get(), frameInfo);
+	cmdBuffer->bindTarget(pTarget);
+	cmdBuffer->uploadConstants<BlitPushData_t>(frameInfo, uRotation);
+
+	uint32_t uLogicalWidth = pTarget->width(), uLogicalHeight = pTarget->height();
+	if ( uRotation & 1u )
+		std::swap( uLogicalWidth, uLogicalHeight );
+
+	const int pixelsPerGroup = 8;
+	cmdBuffer->dispatch(div_roundup(uLogicalWidth, pixelsPerGroup), div_roundup(uLogicalHeight, pixelsPerGroup));
+
+	return g_device.submit(std::move(cmdBuffer));
+}
+
+// The last GPU submission that has finished; safe from any thread.
+uint64_t vulkan_completed_seq()
+{
+	return g_device.completedSeqNo();
+}
+
 void vulkan_wait( uint64_t ulSeqNo, bool bReset )
 {
 	return g_device.wait( ulSeqNo, bReset );

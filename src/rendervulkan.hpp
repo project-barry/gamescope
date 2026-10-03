@@ -487,6 +487,9 @@ void vulkan_update_luts(const gamescope::Rc<CVulkanTexture>& lut1d, const gamesc
 gamescope::Rc<CVulkanTexture> vulkan_get_hacky_blank_texture();
 
 std::optional<uint64_t> vulkan_screenshot( const struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pScreenshotTexture, gamescope::Rc<CVulkanTexture> pYUVOutTexture );
+gamescope::Rc<CVulkanTexture> vulkan_create_bottom_screen_image( uint32_t uWidth, uint32_t uHeight );
+std::optional<uint64_t> vulkan_composite_bottom_screen( const struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pTarget, uint32_t uRotation );
+uint64_t vulkan_completed_seq();
 
 struct wlr_renderer *vulkan_renderer_create( void );
 

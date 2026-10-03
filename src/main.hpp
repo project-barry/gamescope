@@ -99,6 +99,25 @@ bool drm_lease_companion_active();
 bool drm_lease_client_suspended();
 bool drm_lease_client_quiesce();
 
+namespace gamescope { class IBackendFb; }
+
+// The leased panel drawn by this gamescope (the AYN Thor's bottom screen)
+// for a window that asks for it: acquire suspends the lease's holder and
+// reports the panel's mode size and the rotation step (0-3, as
+// g_uOutputRotation) to draw at; present scans out a framebuffer, blocking
+// until the panel shows it; release hands the panel back.
+struct BottomScreenInfo
+{
+	uint32_t uWidth;
+	uint32_t uHeight;
+	uint32_t uRotation;
+};
+bool drm_bottom_screen_acquire( BottomScreenInfo *pInfo );
+bool drm_bottom_screen_present( uint32_t uFbId );
+// The KMS framebuffer id of a scanout image made by this (DRM) backend.
+uint32_t drm_bottom_screen_fb_id( gamescope::IBackendFb *pFb );
+void drm_bottom_screen_release();
+
 enum class GamescopeUpscaleFilter : uint32_t
 {
     LINEAR = 0,
