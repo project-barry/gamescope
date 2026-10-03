@@ -55,6 +55,8 @@ struct CommitDoneEntry_t
 	uint64_t earliestPresentTime;
 	uint64_t earliestLatchTime;
 	bool fifo;
+	uint64_t doneTime = 0; // for GAMESCOPE_BOTTOM_SCREEN_TRACE
+	bool traced = false;
 };
 
 struct CommitDoneList_t

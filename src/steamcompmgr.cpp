@@ -8516,6 +8516,106 @@ bool handle_done_commit( steamcompmgr_win_t *w, xwayland_ctx_t *ctx, uint64_t co
 }
 
 // TODO: Merge these two functions.
+// GAMESCOPE_BOTTOM_SCREEN_TRACE=1: every 2 s, how this output's vblanks
+// took the frames of the windows the bottom screen does not show: vblanks
+// seen and the longest gap between them, then for each window (its title
+// and pid) commits done (FIFO or not) and latched, vblanks with no FIFO commit waiting, FIFO commits held back by
+// the limiter, by a second one in the same vblank or by a present time not
+// reached yet, how long a done commit waited to be latched and how long the
+// app took from its frame callback to its next done commit (ms, mean/max).
+namespace
+{
+	struct TopWindowTrace
+	{
+		static bool Enabled()
+		{
+			static const bool s_bEnabled = []
+			{
+				const char *p = getenv( "GAMESCOPE_BOTTOM_SCREEN_TRACE" );
+				return p && *p && strcmp( p, "0" ) != 0;
+			}();
+			return s_bEnabled;
+		}
+
+		struct Timing
+		{
+			uint64_t ulSum = 0, ulMax = 0;
+			uint32_t uCount = 0;
+			void Add( uint64_t ul ) { ulSum += ul; ulMax = std::max( ulMax, ul ); uCount++; }
+			double Mean() const { return uCount ? ulSum / 1e6 / uCount : 0.0; }
+			double Max() const { return ulMax / 1e6; }
+		};
+
+		// Per window: its title (or process) and its pid.
+		struct Win
+		{
+			std::string sName;
+			pid_t nPid = -1;
+			uint32_t uDoneFifo = 0, uDoneOther = 0, uLatchedFifo = 0, uLatchedOther = 0;
+			uint32_t uHeldLimiter = 0, uHeldSecond = 0, uHeldTimed = 0;
+			Timing Wait, App;
+		};
+
+		uint64_t ulSince = 0, ulLastVblank = 0, ulMaxGap = 0, ulLastVblankIdx = 0;
+		bool bVblankSeen = false, bLastFifoWaiting = false;
+		uint32_t uVblanks = 0, uEmpty = 0;
+		std::unordered_map<uint64_t, Win> mapWins;
+
+		Win &For( const steamcompmgr_win_t *w )
+		{
+			Win &win = mapWins[ w->seq ];
+			if ( win.sName.empty() )
+			{
+				win.sName = w->debug_name();
+				win.nPid = w->pid;
+			}
+			return win;
+		}
+
+		// Once per vblank and Xwayland server: a vblank counts once.
+		void Vblank( uint64_t ulNow, uint64_t ulVblankIdx, bool bFifoWaiting )
+		{
+			if ( bVblankSeen && ulVblankIdx == ulLastVblankIdx )
+			{
+				if ( bFifoWaiting && !bLastFifoWaiting )
+					uEmpty--;
+				bLastFifoWaiting |= bFifoWaiting;
+				return;
+			}
+			bVblankSeen = true;
+			ulLastVblankIdx = ulVblankIdx;
+			bLastFifoWaiting = bFifoWaiting;
+			if ( ulLastVblank )
+				ulMaxGap = std::max( ulMaxGap, ulNow - ulLastVblank );
+			ulLastVblank = ulNow;
+			uVblanks++;
+			uEmpty += !bFifoWaiting;
+			if ( !ulSince )
+				ulSince = ulNow;
+			if ( ulNow - ulSince < 2'000'000'000ul )
+				return;
+			xwm_log.infof( "top-window trace: %u vblanks in %.1fs (longest gap %.1f ms), %u with no FIFO commit waiting",
+				uVblanks, ( ulNow - ulSince ) / 1e9, ulMaxGap / 1e6, uEmpty );
+			for ( const auto &[ ulSeq, win ] : mapWins )
+			{
+				xwm_log.infof( "top-window trace:   window %" PRIu64 " pid %d \"%s\": done fifo %u other %u, latched fifo %u other %u; "
+					"FIFO held: limiter %u, second in a vblank %u, present time %u; "
+					"ms mean/max: wait for latch %.1f/%.1f, frame callback to done %.1f/%.1f",
+					ulSeq, (int)win.nPid, win.sName.c_str(),
+					win.uDoneFifo, win.uDoneOther, win.uLatchedFifo, win.uLatchedOther,
+					win.uHeldLimiter, win.uHeldSecond, win.uHeldTimed,
+					win.Wait.Mean(), win.Wait.Max(), win.App.Mean(), win.App.Max() );
+			}
+			*this = TopWindowTrace{};
+			ulLastVblank = ulNow;
+			bVblankSeen = true;
+			ulLastVblankIdx = ulVblankIdx;
+			bLastFifoWaiting = bFifoWaiting;
+		}
+	};
+	TopWindowTrace s_TopWindowTrace;
+}
+
 void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vblank_idx )
 {
 	std::lock_guard<std::mutex> lock( ctx->doneCommits.listCommitsDoneLock );
@@ -8533,6 +8633,9 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
 	fifo_win_seqs.reserve( 32 );
 
 	uint64_t now = get_time_in_nanos();
+
+	const bool bTraceTop = TopWindowTrace::Enabled();
+	bool bFifoWaiting = false;
 
 	// very fast loop yes
 	for ( auto& entry : ctx->doneCommits.listCommitsDone )
@@ -8555,6 +8658,24 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
 		// output's vblank, and the limiter's, only made its frames late.
 		const bool bPacedHere = !entry_win || !bottom_screen_shows( entry_win );
 
+		const bool bTrace = bTraceTop && entry_win && bPacedHere;
+		if ( bTrace && !entry.traced )
+		{
+			entry.traced = true;
+			auto &win = s_TopWindowTrace.For( entry_win );
+			( entry.fifo ? win.uDoneFifo : win.uDoneOther )++;
+			if ( entry.doneTime > entry_win->last_commit_first_latch_time && entry_win->last_commit_first_latch_time )
+				win.App.Add( entry.doneTime - entry_win->last_commit_first_latch_time );
+		}
+		if ( bTrace && entry.fifo && vblank )
+		{
+			bFifoWaiting = true;
+			if ( !entry_vblank )
+				s_TopWindowTrace.For( entry_win ).uHeldLimiter++;
+			else if ( fifo_win_seqs.count(entry.winSeq) > 0 )
+				s_TopWindowTrace.For( entry_win ).uHeldSecond++;
+		}
+
 		if (entry.fifo && bPacedHere && (!entry_vblank || fifo_win_seqs.count(entry.winSeq) > 0))
 		{
 			commits_before_their_time.push_back( entry );
@@ -8569,6 +8690,8 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
 
 		if ( entry.desiredPresentTime > next_refresh_time )
 		{
+			if ( bTrace && entry.fifo && vblank )
+				s_TopWindowTrace.For( entry_win ).uHeldTimed++;
 			commits_before_their_time.push_back( entry );
 			continue;
 		}
@@ -8577,8 +8700,18 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
 		{
 			if (entry.fifo)
 				fifo_win_seqs.insert(entry.winSeq);
+			if ( bTrace )
+			{
+				auto &win = s_TopWindowTrace.For( entry_win );
+				( entry.fifo ? win.uLatchedFifo : win.uLatchedOther )++;
+				if ( entry.doneTime && now > entry.doneTime )
+					win.Wait.Add( now - entry.doneTime );
+			}
 		}
 	}
+
+	if ( bTraceTop && vblank )
+		s_TopWindowTrace.Vblank( now, vblank_idx, bFifoWaiting );
 
 	ctx->doneCommits.listCommitsDone.swap( commits_before_their_time );
 }

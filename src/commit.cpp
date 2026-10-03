@@ -80,6 +80,7 @@ void commit_t::Signal()
             .commitID = commitID,
             .desiredPresentTime = desired_present_time,
             .fifo = fifo,
+            .doneTime = now,
         } );
     }
 
