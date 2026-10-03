@@ -8426,6 +8426,7 @@ bool handle_done_commit( steamcompmgr_win_t *w, xwayland_ctx_t *ctx, uint64_t co
 		{
 			gpuvis_trace_printf( "commit %lu done", w->commit_queue[ j ]->commitID );
 			w->commit_queue[ j ]->done = true;
+			w->commit_queue[ j ]->latched_time = get_time_in_nanos();
 			w->commit_queue[ j ]->earliest_present_time = earliestPresentTime;
 			w->commit_queue[ j ]->present_margin = earliestPresentTime - earliestLatchTime;
 			bFoundWindow = true;
@@ -10369,15 +10370,19 @@ namespace
 		uint32_t uFbId;
 		int nImage;
 		// GAMESCOPE_BOTTOM_SCREEN_TRACE: the commit's arrival, its buffer
-		// being ready, and its composite being queued.
-		uint64_t ulCreated = 0, ulReady = 0, ulQueued = 0;
+		// being ready, steamcompmgr taking it as done, Tick first seeing it,
+		// and its composite being queued.
+		uint64_t ulCreated = 0, ulReady = 0, ulLatched = 0, ulSeen = 0, ulQueued = 0;
+		bool bFifo = false, bTimed = false;
 	};
 
 	// GAMESCOPE_BOTTOM_SCREEN_TRACE=1: every 2 s, where a bottom-screen frame's
 	// time went (ms, mean / max), from the app's commit to the panel:
-	// fence (its buffer being drawn), pick (until a tick takes it), gpu (our
-	// composite), panel (waiting for the refresh), all of it; and how many of
-	// the window's commits were shown.
+	// fence (its buffer being drawn), latch (until steamcompmgr takes it as
+	// done), tick (until the bottom screen sees it), busy (while the last
+	// frame waits for the panel), gpu (our composite), panel (waiting for the
+	// refresh), all of it; how many of the window's commits were shown, and
+	// how many were FIFO or asked for a present time.
 	class CBottomScreenTrace
 	{
 	public:
@@ -10396,9 +10401,13 @@ namespace
 		void Frame( const BottomScreenJob &job, uint64_t ulGpuDone, uint64_t ulShown )
 		{
 			std::unique_lock lock( m_Mutex );
+			auto d = []( uint64_t a, uint64_t b ) { return b > a ? b - a : 0; };
 			const uint64_t ul[ k_nStages ] = {
-				job.ulReady - job.ulCreated, job.ulQueued - job.ulReady,
-				ulGpuDone - job.ulQueued, ulShown - ulGpuDone, ulShown - job.ulCreated };
+				d( job.ulCreated, job.ulReady ), d( job.ulReady, job.ulLatched ),
+				d( job.ulLatched, job.ulSeen ), d( job.ulSeen, job.ulQueued ),
+				d( job.ulQueued, ulGpuDone ), d( ulGpuDone, ulShown ), d( job.ulCreated, ulShown ) };
+			m_uFifo += job.bFifo;
+			m_uTimed += job.bTimed;
 			for ( int i = 0; i < k_nStages; i++ )
 			{
 				m_ulSum[ i ] += ul[ i ];
@@ -10411,22 +10420,23 @@ namespace
 				return;
 			auto ms = [&]( int i ) { return m_ulSum[ i ] / 1e6 / m_uFrames; };
 			auto mx = [&]( int i ) { return m_ulMax[ i ] / 1e6; };
-			xwm_log.infof( "bottom-screen trace: %u frames of %u commits in %.1fs; ms mean/max: "
-				"fence %.1f/%.1f pick %.1f/%.1f gpu %.1f/%.1f panel %.1f/%.1f total %.1f/%.1f",
-				m_uFrames, m_uCommits.exchange( 0 ), ( ulShown - m_ulSince ) / 1e9,
-				ms( 0 ), mx( 0 ), ms( 1 ), mx( 1 ), ms( 2 ), mx( 2 ), ms( 3 ), mx( 3 ), ms( 4 ), mx( 4 ) );
+			xwm_log.infof( "bottom-screen trace: %u frames of %u commits in %.1fs (fifo %u, timed %u); ms mean/max: "
+				"fence %.1f/%.1f latch %.1f/%.1f tick %.1f/%.1f busy %.1f/%.1f gpu %.1f/%.1f panel %.1f/%.1f total %.1f/%.1f",
+				m_uFrames, m_uCommits.exchange( 0 ), ( ulShown - m_ulSince ) / 1e9, m_uFifo, m_uTimed,
+				ms( 0 ), mx( 0 ), ms( 1 ), mx( 1 ), ms( 2 ), mx( 2 ), ms( 3 ), mx( 3 ),
+				ms( 4 ), mx( 4 ), ms( 5 ), mx( 5 ), ms( 6 ), mx( 6 ) );
 			m_ulSince = 0;
-			m_uFrames = 0;
+			m_uFrames = m_uFifo = m_uTimed = 0;
 			for ( int i = 0; i < k_nStages; i++ )
 				m_ulSum[ i ] = m_ulMax[ i ] = 0;
 		}
 
 	private:
 
-		static constexpr int k_nStages = 5;
+		static constexpr int k_nStages = 7;
 		std::mutex m_Mutex;
 		std::atomic<uint32_t> m_uCommits = { 0 };
-		uint32_t m_uFrames = 0;
+		uint32_t m_uFrames = 0, m_uFifo = 0, m_uTimed = 0;
 		uint64_t m_ulSince = 0;
 		uint64_t m_ulSum[ k_nStages ] = {};
 		uint64_t m_ulMax[ k_nStages ] = {};
@@ -10464,6 +10474,7 @@ namespace
 		uint64_t m_ulLastPng = 0;
 		CBottomScreenTrace m_Trace;
 		uint64_t m_ulTraceLastSeenCommitID = 0;
+		uint64_t m_ulTraceSeenAt = 0;
 		// Simulated panel: its refresh clock, and frames shown out of the
 		// window's commits, logged every 2 s for the tests.
 		uint64_t m_ulSimVblank0 = 0;
@@ -10905,6 +10916,7 @@ namespace
 		if ( bTrace && pCommit->commitID != m_ulTraceLastSeenCommitID )
 		{
 			m_ulTraceLastSeenCommitID = pCommit->commitID;
+			m_ulTraceSeenAt = get_time_in_nanos();
 			m_Trace.Commit();
 		}
 
@@ -10972,7 +10984,11 @@ namespace
 			{
 				m_oJob->ulCreated = pCommit->created_time;
 				m_oJob->ulReady = pCommit->present_time ? pCommit->present_time : pCommit->created_time;
+				m_oJob->ulLatched = pCommit->latched_time;
+				m_oJob->ulSeen = m_ulTraceSeenAt;
 				m_oJob->ulQueued = get_time_in_nanos();
+				m_oJob->bFifo = pCommit->fifo;
+				m_oJob->bTimed = pCommit->desired_present_time != 0;
 			}
 		}
 		m_Cv.notify_all();
