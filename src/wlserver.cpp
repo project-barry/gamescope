@@ -562,9 +562,40 @@ static bool bottom_screen_touch_point( double x, double y, double *pSX, double *
 	return *pSX >= 0.0 && *pSY >= 0.0 && *pSX < target.uWidth && *pSY < target.uHeight;
 }
 
+// GAMESCOPE_BOTTOM_SCREEN_TRACE=1: every 2 s while touching, how long the
+// window's touch events took from the touchscreen to it (ms, mean / max).
+static void bottom_screen_touch_trace( uint32_t uEventTime )
+{
+	static const bool s_bTrace = []
+	{
+		const char *p = getenv( "GAMESCOPE_BOTTOM_SCREEN_TRACE" );
+		return p && *p && strcmp( p, "0" ) != 0;
+	}();
+	if ( !s_bTrace )
+		return;
+	static uint32_t s_uCount = 0, s_uMax = 0, s_uSince = 0;
+	static uint64_t s_ulSum = 0;
+	const uint32_t uNow = (uint32_t)( get_time_in_nanos() / 1'000'000ul );
+	const uint32_t uDelay = uNow - uEventTime;
+	if ( uDelay > 10'000 )
+		return; // another clock
+	if ( !s_uCount )
+		s_uSince = uNow;
+	s_uCount++;
+	s_ulSum += uDelay;
+	s_uMax = std::max( s_uMax, uDelay );
+	if ( uNow - s_uSince < 2000 )
+		return;
+	wl_log.infof( "bottom-screen trace: %u touch events, ms to the window mean/max %.1f/%u",
+		s_uCount, (double)s_ulSum / s_uCount, s_uMax );
+	s_uCount = s_uMax = 0;
+	s_ulSum = 0;
+}
+
 static void bottom_screen_touch_deliver( const BottomScreenTouchEvent &event )
 {
 	auto &state = s_BottomScreenTouch;
+	bottom_screen_touch_trace( event.uTime );
 	struct wlr_seat *pSeat = wlserver.wlr.seat;
 	const int nSeatId = k_nBottomScreenTouchIdBase + event.nId;
 	double flSX, flSY;

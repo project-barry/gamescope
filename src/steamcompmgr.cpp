@@ -10363,6 +10363,68 @@ namespace
 		uint64_t ulSeqNo;
 		uint32_t uFbId;
 		int nImage;
+		// GAMESCOPE_BOTTOM_SCREEN_TRACE: the commit's arrival, its buffer
+		// being ready, and its composite being queued.
+		uint64_t ulCreated = 0, ulReady = 0, ulQueued = 0;
+	};
+
+	// GAMESCOPE_BOTTOM_SCREEN_TRACE=1: every 2 s, where a bottom-screen frame's
+	// time went (ms, mean / max), from the app's commit to the panel:
+	// fence (its buffer being drawn), pick (until a tick takes it), gpu (our
+	// composite), panel (waiting for the refresh), all of it; and how many of
+	// the window's commits were shown.
+	class CBottomScreenTrace
+	{
+	public:
+		static bool Enabled()
+		{
+			static const bool s_bEnabled = []
+			{
+				const char *p = getenv( "GAMESCOPE_BOTTOM_SCREEN_TRACE" );
+				return p && *p && strcmp( p, "0" ) != 0;
+			}();
+			return s_bEnabled;
+		}
+
+		void Commit() { m_uCommits++; }
+
+		void Frame( const BottomScreenJob &job, uint64_t ulGpuDone, uint64_t ulShown )
+		{
+			std::unique_lock lock( m_Mutex );
+			const uint64_t ul[ k_nStages ] = {
+				job.ulReady - job.ulCreated, job.ulQueued - job.ulReady,
+				ulGpuDone - job.ulQueued, ulShown - ulGpuDone, ulShown - job.ulCreated };
+			for ( int i = 0; i < k_nStages; i++ )
+			{
+				m_ulSum[ i ] += ul[ i ];
+				m_ulMax[ i ] = std::max( m_ulMax[ i ], ul[ i ] );
+			}
+			m_uFrames++;
+			if ( !m_ulSince )
+				m_ulSince = ulShown;
+			if ( ulShown - m_ulSince < 2'000'000'000ul )
+				return;
+			auto ms = [&]( int i ) { return m_ulSum[ i ] / 1e6 / m_uFrames; };
+			auto mx = [&]( int i ) { return m_ulMax[ i ] / 1e6; };
+			xwm_log.infof( "bottom-screen trace: %u frames of %u commits in %.1fs; ms mean/max: "
+				"fence %.1f/%.1f pick %.1f/%.1f gpu %.1f/%.1f panel %.1f/%.1f total %.1f/%.1f",
+				m_uFrames, m_uCommits.exchange( 0 ), ( ulShown - m_ulSince ) / 1e9,
+				ms( 0 ), mx( 0 ), ms( 1 ), mx( 1 ), ms( 2 ), mx( 2 ), ms( 3 ), mx( 3 ), ms( 4 ), mx( 4 ) );
+			m_ulSince = 0;
+			m_uFrames = 0;
+			for ( int i = 0; i < k_nStages; i++ )
+				m_ulSum[ i ] = m_ulMax[ i ] = 0;
+		}
+
+	private:
+
+		static constexpr int k_nStages = 5;
+		std::mutex m_Mutex;
+		std::atomic<uint32_t> m_uCommits = { 0 };
+		uint32_t m_uFrames = 0;
+		uint64_t m_ulSince = 0;
+		uint64_t m_ulSum[ k_nStages ] = {};
+		uint64_t m_ulMax[ k_nStages ] = {};
 	};
 
 	class CBottomScreen
@@ -10395,6 +10457,8 @@ namespace
 
 		const std::optional<Simulated> m_oSimulated = ParseSimulated();
 		uint64_t m_ulLastPng = 0;
+		CBottomScreenTrace m_Trace;
+		uint64_t m_ulTraceLastSeenCommitID = 0;
 		// Simulated panel: its refresh clock, and frames shown out of the
 		// window's commits, logged every 2 s for the tests.
 		uint64_t m_ulSimVblank0 = 0;
@@ -10621,7 +10685,10 @@ namespace
 			// The frame is scanned out once the GPU has drawn it.
 			while ( vulkan_completed_seq() < job.ulSeqNo )
 				std::this_thread::sleep_for( std::chrono::microseconds( 500 ) );
+			const uint64_t ulGpuDone = job.ulQueued ? get_time_in_nanos() : 0;
 			const bool bShown = PanelPresent( job );
+			if ( bShown && job.ulQueued )
+				m_Trace.Frame( job, ulGpuDone, get_time_in_nanos() );
 			{
 				std::unique_lock lock( m_Mutex );
 				if ( bShown )
@@ -10829,6 +10896,12 @@ namespace
 			m_ulSimLastSeenCommitID = pCommit->commitID;
 			m_uSimCommits++;
 		}
+		const bool bTrace = CBottomScreenTrace::Enabled();
+		if ( bTrace && pCommit->commitID != m_ulTraceLastSeenCommitID )
+		{
+			m_ulTraceLastSeenCommitID = pCommit->commitID;
+			m_Trace.Commit();
+		}
 
 		int nImage;
 		{
@@ -10890,6 +10963,12 @@ namespace
 			std::unique_lock lock( m_Mutex );
 			m_bBusy = true;
 			m_oJob = BottomScreenJob{ *oSeqNo, pFb ? drm_bottom_screen_fb_id( pFb ) : 0u, nImage };
+			if ( bTrace )
+			{
+				m_oJob->ulCreated = pCommit->created_time;
+				m_oJob->ulReady = pCommit->present_time ? pCommit->present_time : pCommit->created_time;
+				m_oJob->ulQueued = get_time_in_nanos();
+			}
 		}
 		m_Cv.notify_all();
 	}

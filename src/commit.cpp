@@ -11,6 +11,7 @@ commit_t::commit_t()
 {
     static uint64_t maxCommmitID = 0;
     commitID = ++maxCommmitID;
+    created_time = get_time_in_nanos();
 }
 commit_t::~commit_t()
 {

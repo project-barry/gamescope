@@ -75,6 +75,7 @@ struct commit_t final : public gamescope::RcObject, public gamescope::IWaitable,
 	uint64_t earliest_present_time = 0;
 	uint64_t present_margin = 0;
 	uint64_t present_time = 0;
+	uint64_t created_time = 0; // for GAMESCOPE_BOTTOM_SCREEN_TRACE
 
 	std::mutex m_WaitableCommitStateMutex;
 	int m_nCommitFence = -1;

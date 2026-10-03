@@ -113,6 +113,10 @@ every 2 s the log says how many of the window's commits were shown. With
 there twice a second. `tests/dual-screen/` uses it, with
 `bottom_screen_touch`, to check the window rules, focus, drawing, touch,
 yielding and frame pacing under a headless gamescope.
+`GAMESCOPE_BOTTOM_SCREEN_TRACE=1` logs, every 2 s, where the bottom
+screen's frames spent their time (the app's buffer, waiting for a tick, the
+composite, waiting for the panel) and how long its touches took to reach
+the window.
 
 ## Planned
 
