@@ -11571,6 +11571,25 @@ steamcompmgr_main(int argc, char **argv)
 						steamcompmgr_flush_frame_done(w);
 					}
 				}
+
+				// The bottom screen's window is asked for its next frame as
+				// soon as one is done: the bottom screen shows the newest it
+				// has at each of its refreshes, so the app never waits on
+				// either output. An emulator presenting its two windows in
+				// turn otherwise waited up to a refresh for this one, and the
+				// pair overran a 60 Hz frame (Azahar: ~55 fps with two
+				// screens on an AYN Thor, 60 with one). At most every 4 ms,
+				// for an app that draws only when asked.
+				const uint64_t ulNow = get_time_in_nanos();
+				for (steamcompmgr_win_t *w = server->ctx->list; w; w = w->xwayland().next)
+				{
+					if ( w->receivedDoneCommit && bottom_screen_shows( w ) &&
+						 ulNow - w->last_commit_first_latch_time >= 4'000'000ul )
+					{
+						w->unlockedForFrameCallback = true;
+						steamcompmgr_flush_frame_done(w);
+					}
+				}
 			}
 		}
 
