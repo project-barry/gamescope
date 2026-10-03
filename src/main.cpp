@@ -23,6 +23,7 @@
 #include <climits>
 
 #include "main.hpp"
+#include "backlight.hpp"
 #include "steamcompmgr.hpp"
 #include "rendervulkan.hpp"
 #include "wlserver.hpp"
@@ -48,6 +49,8 @@ using namespace std::literals;
 EStreamColorspace g_ForcedNV12ColorSpace = k_EStreamColorspace_Unknown;
 extern gamescope::ConVar<bool> cv_adaptive_sync;
 extern gamescope::ConVar<bool> cv_shutdown_on_primary_child_death;
+
+extern bool env_to_bool(const char *env);
 
 const char *gamescope_optstring = nullptr;
 const char *g_pOriginalDisplay = nullptr;
@@ -91,9 +94,11 @@ const struct option *gamescope_options = (struct option[]){
 	{ "disable-layers", no_argument, nullptr, 0 },
 	{ "debug-layers", no_argument, nullptr, 0 },
 	{ "prefer-output", required_argument, nullptr, 'O' },
+	{ "force-internal", no_argument, nullptr, 0 },
 	{ "default-touch-mode", required_argument, nullptr, 0 },
 	{ "generate-drm-mode", required_argument, nullptr, 0 },
 	{ "immediate-flips", no_argument, nullptr, 0 },
+	{ "use-rotation-shader", no_argument, nullptr, 0 },
 	{ "framerate-limit", required_argument, nullptr, 0 },
 
 	// openvr options
@@ -232,9 +237,11 @@ const char usage[] =
 	"\n"
 	"Embedded mode options:\n"
 	"  -O, --prefer-output            list of connectors in order of preference (ex: DP-1,DP-2,DP-3,HDMI-A-1)\n"
+	"  --force-internal               never scanout to HDMI/DP; keep the internal DSI/eDP panel\n"
 	"  --default-touch-mode           0: hover, 1: left, 2: right, 3: middle, 4: passthrough\n"
 	"  --generate-drm-mode            DRM mode generation algorithm (cvt, fixed)\n"
 	"  --immediate-flips              Enable immediate flips, may result in tearing\n"
+	"  --use-rotation-shader          same as --force-composition-rotation\n"
 	"\n"
 #if HAVE_OPENVR
 	"VR mode options:\n"
@@ -305,6 +312,7 @@ uint32_t g_nOutputHeight = 0;
 int g_nOutputRefresh = 0;
 bool g_bOutputHDREnabled = false;
 
+
 bool g_bFullscreen = false;
 bool g_bForceRelativeMouse = false;
 
@@ -313,7 +321,7 @@ bool g_bGrabbed = false;
 float g_mouseSensitivity = 1.0;
 
 GamescopeUpscaleFilter g_wantedUpscaleFilter = GamescopeUpscaleFilter::LINEAR;
-GamescopeUpscaleScaler g_wantedUpscaleScaler = GamescopeUpscaleScaler::AUTO;
+GamescopeUpscaleScaler g_wantedUpscaleScaler = GamescopeUpscaleScaler::FIT;
 int g_upscaleFilterSharpness = 2;
 
 gamescope::GamescopeModeGeneration g_eGamescopeModeGeneration = gamescope::GAMESCOPE_MODE_GENERATE_CVT;
@@ -828,6 +836,12 @@ int main(int argc, char **argv)
 					sscanf( optarg, "%X:%X", &vendorID, &deviceID );
 					g_preferVendorID = vendorID;
 					g_preferDeviceID = deviceID;
+				} else if (strcmp(opt_name, "force-internal") == 0) {
+					g_bForceInternal = true;
+					g_bForceInternalLocked = true;
+				} else if (strcmp(opt_name, "use-rotation-shader") == 0) {
+					// konkr: older name for --force-composition-rotation (session scripts use it)
+					g_bForceCompositionRotation = true;
 				} else if (strcmp(opt_name, "immediate-flips") == 0) {
 					cv_tearing_enabled = true;
 				} else if (strcmp(opt_name, "force-grab-cursor") == 0) {
@@ -877,6 +891,11 @@ int main(int argc, char **argv)
 
 	// Print this after the re-exec, so we only announce ourselves once.
 	gamescope::PrintVersion();
+	if ( !g_bForceInternalLocked && env_to_bool( getenv( "GAMESCOPE_FORCE_INTERNAL" ) ) )
+	{
+		g_bForceInternal = true;
+		g_bForceInternalLocked = true;
+	}
 
 	if ( gamescope::Process::HasCapSysNice() )
 	{
@@ -1065,6 +1084,8 @@ int main(int argc, char **argv)
 		fprintf( stderr, "Failed to initialize wlserver\n" );
 		return 1;
 	}
+
+	gamescope::InitBacklight();
 
 	gamescope_xwayland_server_t *base_server = wlserver_get_xwayland_server(0);
 

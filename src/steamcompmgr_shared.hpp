@@ -115,6 +115,8 @@ struct steamcompmgr_win_t {
 	uint32_t inputFocusMode = 0;
 	uint32_t appID = 0;
 	uint32_t steamAppID = 0;
+	// konkr: xdg window from konkr-android.service; appID follows KONKR_ANDROID_APPID
+	bool bKonkrAndroid = false;
 	bool isOverlay = false;
 	bool isExternalOverlay = false;
 	// mangoapp keeps the property but zeroes it while hidden.

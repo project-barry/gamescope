@@ -4,10 +4,12 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <errno.h>
 #include <pthread.h>
 #include <string.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <fstream>
 #include <xf86drm.h>
 #include <sys/eventfd.h>
 
@@ -55,11 +57,13 @@
 #include "gamescope-private-protocol.h"
 #include "gamescope-swapchain-protocol.h"
 #include "presentation-time-protocol.h"
+#include "wlr-gamma-control-unstable-v1-protocol.h"
 
 #include "wlserver.hpp"
 #include "hdmi.h"
 #include "main.hpp"
 #include "steamcompmgr.hpp"
+#include "backlight.hpp"
 #include "color_helpers.h"
 #include "log.hpp"
 #include "ime.hpp"
@@ -305,6 +309,15 @@ static void wlserver_handle_key(struct wl_listener *listener, void *data)
 	// TODO: Remove the below hack when Steam is shipping
 	// `gamescope_action_binding_manager` in Steam Stable
 	// as it can just use a keybind to grab these always.
+	if ( event->state == WL_KEYBOARD_KEY_STATE_PRESSED &&
+		 ( keysym == XKB_KEY_XF86MonBrightnessUp || keysym == XKB_KEY_XF86MonBrightnessDown ) )
+	{
+		const int nDir = ( keysym == XKB_KEY_XF86MonBrightnessUp ) ? 1 : -1;
+		if ( gamescope::StepBacklight( nDir ) )
+			force_repaint();
+		return;
+	}
+
 	bool forbidden_key =
 		keysym == XKB_KEY_XF86AudioLowerVolume ||
 		keysym == XKB_KEY_XF86AudioRaiseVolume ||
@@ -1726,6 +1739,111 @@ static void handle_wlr_log(enum wlr_log_importance importance, const char *fmt, 
 	wl_log.vlogf(prio, fmt, args);
 }
 
+// Steam night mode uses X11/RandR gamma. Xwayland forwards that via
+// wlr-gamma-control-v1, but the headless output has no CRTC gamma.
+// Advertise a 256-entry LUT and apply it as an RGB CTM in the blit.
+static constexpr uint32_t kNightGammaSize = 256;
+
+static void night_gamma_apply_identity()
+{
+	steamcompmgr_set_night_rgb_from_gamma_ramp( nullptr, nullptr, nullptr, 0, true );
+}
+
+static void night_gamma_handle_destroy( struct wl_client *client, struct wl_resource *resource )
+{
+	wl_resource_destroy( resource );
+}
+
+static void night_gamma_handle_resource_destroy( struct wl_resource *resource )
+{
+	night_gamma_apply_identity();
+}
+
+static void night_gamma_handle_set_gamma( struct wl_client *client, struct wl_resource *resource, int32_t fd )
+{
+	const size_t tableBytes = size_t( kNightGammaSize ) * 3 * sizeof( uint16_t );
+	std::vector<uint16_t> table( kNightGammaSize * 3 );
+
+	size_t nTotal = 0;
+	while ( nTotal < tableBytes )
+	{
+		ssize_t nRead = read( fd, reinterpret_cast<uint8_t *>( table.data() ) + nTotal, tableBytes - nTotal );
+		if ( nRead < 0 && errno == EINTR )
+			continue;
+		if ( nRead <= 0 )
+			break;
+		nTotal += size_t( nRead );
+	}
+	close( fd );
+
+	if ( nTotal != tableBytes )
+	{
+		zwlr_gamma_control_v1_send_failed( resource );
+		night_gamma_apply_identity();
+		return;
+	}
+
+	const uint16_t *r = table.data();
+	const uint16_t *g = r + kNightGammaSize;
+	const uint16_t *b = g + kNightGammaSize;
+	steamcompmgr_set_night_rgb_from_gamma_ramp( r, g, b, kNightGammaSize, true );
+
+	static int s_nGammaLogs = 0;
+	if ( s_nGammaLogs < 8 )
+	{
+		s_nGammaLogs++;
+		wl_log.infof( "wlr-gamma ramp size=%u end=(%u,%u,%u)", kNightGammaSize, r[kNightGammaSize - 1], g[kNightGammaSize - 1], b[kNightGammaSize - 1] );
+	}
+}
+
+static const struct zwlr_gamma_control_v1_interface night_gamma_impl = {
+	.set_gamma = night_gamma_handle_set_gamma,
+	.destroy = night_gamma_handle_destroy,
+};
+
+static void night_gamma_manager_get_gamma_control( struct wl_client *client, struct wl_resource *manager_resource, uint32_t id, struct wl_resource *output_resource )
+{
+	uint32_t version = wl_resource_get_version( manager_resource );
+	struct wl_resource *resource = wl_resource_create( client, &zwlr_gamma_control_v1_interface, version, id );
+	if ( !resource )
+	{
+		wl_client_post_no_memory( client );
+		return;
+	}
+
+	wl_resource_set_implementation( resource, &night_gamma_impl, nullptr, night_gamma_handle_resource_destroy );
+	zwlr_gamma_control_v1_send_gamma_size( resource, kNightGammaSize );
+}
+
+static void night_gamma_manager_destroy( struct wl_client *client, struct wl_resource *resource )
+{
+	wl_resource_destroy( resource );
+}
+
+static const struct zwlr_gamma_control_manager_v1_interface night_gamma_manager_impl = {
+	.get_gamma_control = night_gamma_manager_get_gamma_control,
+	.destroy = night_gamma_manager_destroy,
+};
+
+static void night_gamma_manager_bind( struct wl_client *client, void *data, uint32_t version, uint32_t id )
+{
+	struct wl_resource *resource = wl_resource_create( client, &zwlr_gamma_control_manager_v1_interface, version, id );
+	if ( !resource )
+	{
+		wl_client_post_no_memory( client );
+		return;
+	}
+	wl_resource_set_implementation( resource, &night_gamma_manager_impl, nullptr, nullptr );
+}
+
+static bool create_night_gamma_control()
+{
+	if ( !wl_global_create( wlserver.display, &zwlr_gamma_control_manager_v1_interface, 1, nullptr, night_gamma_manager_bind ) )
+		return false;
+	wl_log.infof( "Enabled wlr-gamma-control-v1 for Steam night mode" );
+	return true;
+}
+
 void wlserver_set_output_info( const wlserver_output_info *info )
 {
 	free(wlserver.output_info.description);
@@ -1999,6 +2117,29 @@ void xdg_toplevel_new(struct wl_listener *listener, void *data)
 {
 }
 
+
+// konkr: Lepton (Android) draws from a podman container, outside Steam's
+// reaper tree, so get_appid_from_pid finds nothing. A per-app launch still
+// runs in the launch's systemd scope (app-steam-app<N>-<pid>.scope); the
+// shared konkr-android.service window follows KONKR_ANDROID_APPID instead.
+static uint32_t get_container_appid( pid_t pid, steamcompmgr_win_t *window )
+{
+	char path[64];
+	snprintf( path, sizeof( path ), "/proc/%d/cgroup", pid );
+	std::ifstream cgroup( path );
+	std::string line;
+	while ( std::getline( cgroup, line ) )
+	{
+		size_t nPos = line.find( "app-steam-app" );
+		uint32_t unAppId = 0;
+		if ( nPos != std::string::npos && sscanf( line.c_str() + nPos, "app-steam-app%u", &unAppId ) == 1 && unAppId )
+			return unAppId;
+		if ( line.find( "konkr-android.service" ) != std::string::npos )
+			window->bKonkrAndroid = true;
+	}
+	return 0;
+}
+
 wlserver_xdg_surface_info* waylandy_type_surface_new(struct wl_client *client, struct wlr_surface *surface)
 {
 	wlserver_wl_surface_info *wlserver_surface = get_wl_surface_info(surface);
@@ -2021,6 +2162,8 @@ wlserver_xdg_surface_info* waylandy_type_surface_new(struct wl_client *client, s
 		pid_t nPid = 0;
 		wl_client_get_credentials( client, &nPid, nullptr, nullptr );
 		window->appID = gamescope::Process::GetAppIdFromPid( nPid );
+		if ( !window->appID )
+			window->appID = get_container_appid( nPid, window.get() );
 	}
 	window->_window_types.emplace<steamcompmgr_xdg_win_t>();
 
@@ -2235,6 +2378,9 @@ bool wlserver_init( void ) {
 	create_gamescope_private();
 
 	create_presentation_time();
+
+	if ( !create_night_gamma_control() )
+		wl_log.errorf( "Failed to create wlr-gamma-control-v1" );
 
 	// Have to make this old ancient thing for compat with older XWayland.
 	// Someday, he will be purged.
@@ -3229,6 +3375,19 @@ static void apply_touchscreen_orientation(GamescopePanelOrientation orientation,
 	*y = ty;
 }
 
+// konkr: Android (Lepton) wants real touch — scrolling, swipes, pinch — not
+// Steam's click emulation, which non-Steam titles get by default.
+static gamescope::TouchClickMode wlserver_touch_click_mode()
+{
+	if ( wlserver.mouse_focus_surface != NULL )
+	{
+		wlserver_wl_surface_info *info = get_wl_surface_info( wlserver.mouse_focus_surface );
+		if ( info && info->xdg_surface && info->xdg_surface->win && info->xdg_surface->win->bKonkrAndroid )
+			return gamescope::TouchClickModes::Passthrough;
+	}
+	return GetBackend()->GetTouchClickMode();
+}
+
 void wlserver_touchmotion( double x, double y, int touch_id, uint32_t time, bool bAlwaysWarpCursor, gamescope::IBackendConnector* connector )
 {
 	assert( wlserver_is_lock_held() );
@@ -3259,7 +3418,7 @@ void wlserver_touchmotion( double x, double y, int touch_id, uint32_t time, bool
 		trackpad_dx = tx - wlserver.mouse_surface_cursorx;
 		trackpad_dy = ty - wlserver.mouse_surface_cursory;
 
-		gamescope::TouchClickMode eMode = GetBackend()->GetTouchClickMode();
+		gamescope::TouchClickMode eMode = wlserver_touch_click_mode();
 
 		if ( eMode == gamescope::TouchClickModes::Passthrough )
 		{
@@ -3310,7 +3469,7 @@ void wlserver_touchdown( double x, double y, int touch_id, uint32_t time, gamesc
 		tx *= focusedWindowScaleX;
 		ty *= focusedWindowScaleY;
 
-		gamescope::TouchClickMode eMode = GetBackend()->GetTouchClickMode();
+		gamescope::TouchClickMode eMode = wlserver_touch_click_mode();
 
 		if ( eMode == gamescope::TouchClickModes::Passthrough )
 		{

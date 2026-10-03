@@ -121,6 +121,7 @@ src = [
   'Timeline.cpp',
   'reshade_effect_manager.cpp',
   'backend.cpp',
+  'backlight.cpp',
   'x11cursor.cpp',
   'InputEmulation.cpp',
   'LibInputHandler.cpp',
@@ -179,6 +180,9 @@ compiler_version = cc.version()
 
 vcs_tag_cmd = ['git', 'describe', '--always', '--tags', '--dirty=+']
 vcs_tag = run_command(vcs_tag_cmd, check: false).stdout().strip()
+if vcs_tag == ''
+  vcs_tag = '3.16.30+2.g6edb42b-sm8650'
+endif
 version_tag = vcs_tag + ' (' + compiler_name + ' ' + compiler_version + ')'
 
 gamescope_version_conf = configuration_data()

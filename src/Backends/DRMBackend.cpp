@@ -60,6 +60,7 @@
 
 extern int g_nPreferredOutputWidth;
 extern int g_nPreferredOutputHeight;
+extern bool env_to_bool(const char *env);
 
 gamescope::ConVar<bool> cv_drm_single_plane_optimizations( "drm_single_plane_optimizations", true, "Whether or not to enable optimizations for single plane usage." );
 gamescope::ConVar<bool> cv_drm_cursor_plane( "drm_cursor_plane", false, "Scan out the cursor with the DRM cursor plane instead of forcing composition while a cursor is visible. Known driver issues on AMDGPU." );
@@ -1046,6 +1047,41 @@ static int get_connector_priority(struct drm_t *drm, const char *name)
 	return drm->connector_priorities.size();
 }
 
+static uint32_t connector_mode_area( gamescope::CDRMConnector *pConnector )
+{
+	const drmModeConnector *pModeConnector = pConnector->GetModeConnector();
+	if ( !pModeConnector || pModeConnector->count_modes <= 0 )
+		return 0;
+	return uint32_t( pModeConnector->modes[0].hdisplay ) * uint32_t( pModeConnector->modes[0].vdisplay );
+}
+
+static bool drm_skip_external_connectors( struct drm_t *drm )
+{
+	if ( env_to_bool( getenv( "GAMESCOPE_ALLOW_HDMI" ) ) || env_to_bool( getenv( "GAMESCOPE_ALLOW_EXTERNAL" ) ) )
+		return false;
+	if ( g_bForceInternal )
+		return true;
+	for ( auto &iter : drm->connectors )
+	{
+		gamescope::CDRMConnector *pConnector = &iter.second;
+		if ( pConnector->GetScreenType() == gamescope::GAMESCOPE_SCREEN_TYPE_INTERNAL &&
+			 pConnector->GetModeConnector()->connection == DRM_MODE_CONNECTED )
+			return true;
+	}
+	return false;
+}
+
+static bool connector_better_than( struct drm_t *drm, gamescope::CDRMConnector *pCandidate, gamescope::CDRMConnector *pBest )
+{
+	const int nCandidatePriority = get_connector_priority( drm, pCandidate->GetName() );
+	const int nBestPriority = get_connector_priority( drm, pBest->GetName() );
+	if ( nCandidatePriority != nBestPriority )
+		return nCandidatePriority < nBestPriority;
+	if ( pCandidate->GetScreenType() != pBest->GetScreenType() )
+		return pCandidate->GetScreenType() == gamescope::GAMESCOPE_SCREEN_TYPE_INTERNAL;
+	return connector_mode_area( pCandidate ) > connector_mode_area( pBest );
+}
+
 static bool get_saved_mode(const char *description, saved_mode &mode_info)
 {
 	const char *mode_file = getenv("GAMESCOPE_MODE_SAVE_FILE");
@@ -1281,6 +1317,26 @@ namespace gamescope
 
 static gamescope::CDRMHeadlessConnector s_HeadlessConnector;
 
+// If GAMESCOPE_FAKE_OUTPUT_MM is set (WIDTHxHEIGHT in millimetres, e.g. 508x286), use it for
+// wl_output physical size instead of drmModeConnector mmWidth/mmHeight (panel/EDID).
+static void get_wl_output_phys_mm( int connector_mmW, int connector_mmH, int *outW, int *outH )
+{
+	*outW = connector_mmW;
+	*outH = connector_mmH;
+	const char *e = getenv( "GAMESCOPE_FAKE_OUTPUT_MM" );
+	if ( !e || !*e )
+		return;
+	int w = 0, h = 0;
+	if ( sscanf( e, "%dx%d", &w, &h ) != 2 || w <= 0 || h <= 0 )
+	{
+		drm_log.errorf( "GAMESCOPE_FAKE_OUTPUT_MM: invalid '%s' (expected WIDTHxHEIGHT in mm, e.g. 508x286)", e );
+		return;
+	}
+	drm_log.infof( "GAMESCOPE_FAKE_OUTPUT_MM: wl_output %dx%d mm (connector reported %dx%d mm)", w, h, connector_mmW, connector_mmH );
+	*outW = w;
+	*outH = h;
+}
+
 static GamescopeBroadcastRGBMode_t s_ExternalBroadcastRGBMode = GAMESCOPE_BROADCAST_RGB_MODE_AUTOMATIC;
 
 static bool setup_best_connector(struct drm_t *drm, bool force, bool initial)
@@ -1291,7 +1347,7 @@ static bool setup_best_connector(struct drm_t *drm, bool force, bool initial)
 	}
 
 	gamescope::CDRMConnector *best = nullptr;
-	int nBestPriority = INT_MAX;
+	const bool bSkipExternal = drm_skip_external_connectors( drm );
 	for ( auto &iter : drm->connectors )
 	{
 		gamescope::CDRMConnector *pConnector = &iter.second;
@@ -1299,15 +1355,14 @@ static bool setup_best_connector(struct drm_t *drm, bool force, bool initial)
 		if ( pConnector->GetModeConnector()->connection != DRM_MODE_CONNECTED )
 			continue;
 
-		if ( g_bForceInternal && pConnector->GetScreenType() == gamescope::GAMESCOPE_SCREEN_TYPE_EXTERNAL )
-			continue;
-
-		int nPriority = get_connector_priority( drm, pConnector->GetName() );
-		if ( nPriority < nBestPriority )
+		if ( bSkipExternal && pConnector->GetScreenType() == gamescope::GAMESCOPE_SCREEN_TYPE_EXTERNAL )
 		{
-			best = pConnector;
-			nBestPriority = nPriority;
+			drm_log.infof( "skipping external connector '%s' (force internal / DSI present)", pConnector->GetName() );
+			continue;
 		}
+
+		if ( !best || connector_better_than( drm, pConnector, best ) )
+			best = pConnector;
 	}
 
 	if ( best && best == drm->pConnector )
@@ -1333,9 +1388,15 @@ static bool setup_best_connector(struct drm_t *drm, bool force, bool initial)
 		drm_unset_mode(drm, force);
 		s_HeadlessConnector.RebuildModes();
 
+		// konkr: panels without a physical size (EDID-less DSI) get GAMESCOPE_FAKE_OUTPUT_MM.
+		int physW = 0, physH = 0;
+		get_wl_output_phys_mm( 0, 0, &physW, &physH );
+
 		// Steam keys saved modes by the description, so get_last_display_mode reads this name back.
 		const struct wlserver_output_info wlserver_output_info = {
 			.description = k_pszVirtualScreenName,
+			.phys_width = physW,
+			.phys_height = physH,
 		};
 		wlserver_lock();
 		wlserver_set_output_info(&wlserver_output_info);
@@ -1392,10 +1453,12 @@ static bool setup_best_connector(struct drm_t *drm, bool force, bool initial)
 	// Don't allow rollback of mode_id after connector change
 	drm->current.mode_id = drm->pending.mode_id;
 
+	int physW = 0, physH = 0;
+	get_wl_output_phys_mm( (int) best->GetModeConnector()->mmWidth, (int) best->GetModeConnector()->mmHeight, &physW, &physH );
 	const struct wlserver_output_info wlserver_output_info = {
 		.description = description,
-		.phys_width = (int) best->GetModeConnector()->mmWidth,
-		.phys_height = (int) best->GetModeConnector()->mmHeight,
+		.phys_width = physW,
+		.phys_height = physH,
 	};
 	wlserver_lock();
 	wlserver_set_output_info(&wlserver_output_info);
@@ -1961,6 +2024,26 @@ static void update_drm_effective_orientations( struct drm_t *drm, const drmModeM
 
 		pDRMExternalConnector->UpdateEffectiveOrientation( pExternalMode );
 	}
+
+	// konkr: MSM/Adreno advertises plane rotation but rejects it (EINVAL on a
+	// 1-layer flip → backlight on, no image), so upstream's scanout-rotation
+	// autodetect would pick it. Rotate in the compositor instead.
+	// Override with GAMESCOPE_KMS_ROTATION=1 on GPUs that can rotate in hardware.
+	if ( drm->pConnector && !env_to_bool( getenv( "GAMESCOPE_KMS_ROTATION" ) ) )
+	{
+		switch ( drm->pConnector->GetCurrentOrientation() )
+		{
+		case GAMESCOPE_PANEL_ORIENTATION_90:
+		case GAMESCOPE_PANEL_ORIENTATION_270:
+		case GAMESCOPE_PANEL_ORIENTATION_180:
+			if ( !g_bForceCompositionRotation )
+				drm_log.infof( "Rotating in the compositor (DTB panel orientation; KMS plane rotation is unreliable on MSM)" );
+			g_bForceCompositionRotation = true;
+			break;
+		default:
+			break;
+		}
+	}
 }
 
 // Only used for NV12 buffers
@@ -2494,6 +2577,16 @@ namespace gamescope
 				switch ( this->GetProperties().panel_orientation->GetCurrentValue() )
 				{
 					case DRM_MODE_PANEL_ORIENTATION_NORMAL:
+						// Native DSI modes are often portrait 1080x1920 with
+						// panel_orientation=Normal. The session still uses a
+						// landscape nest, so treat portrait modes as rotated
+						// (same auto-detect as a missing property).
+						if ( this->GetScreenType() == GAMESCOPE_SCREEN_TYPE_INTERNAL && pMode
+							 && pMode->hdisplay < pMode->vdisplay )
+						{
+							m_ChosenOrientation = GAMESCOPE_PANEL_ORIENTATION_270;
+							return;
+						}
 						m_ChosenOrientation = GAMESCOPE_PANEL_ORIENTATION_0;
 						return;
 					case DRM_MODE_PANEL_ORIENTATION_BOTTOM_UP:
@@ -2526,16 +2619,51 @@ namespace gamescope
 
 	void CDRMConnector::ParseEDID()
 	{
+		// SteamOS-ARM-SM8650: DSI panels (KONKR Pocket FIT) have no EDID. Without
+		// this, the early returns below skip the "unknown internal display ->
+		// use every listed mode's refresh" fallback, the refresh table stays
+		// empty and Steam offers no refresh-rate slider.
+		auto collectModeRefreshRates = [this]()
+		{
+			m_Mutable.ValidDynamicRefreshRates.clear();
+			if ( GetScreenType() != GAMESCOPE_SCREEN_TYPE_INTERNAL )
+				return;
+			const drmModeModeInfo *pPreferredMode = find_mode( m_pConnector.get(), 0, 0, 0 );
+			if ( !pPreferredMode )
+				return;
+			for ( int i = 0; i < m_pConnector->count_modes; i++ )
+			{
+				const drmModeModeInfo *pMode = &m_pConnector->modes[i];
+				if ( pMode->hdisplay != pPreferredMode->hdisplay || pMode->vdisplay != pPreferredMode->vdisplay )
+					continue;
+				if ( !Algorithm::Contains( m_Mutable.ValidDynamicRefreshRates, pMode->vrefresh ) )
+					m_Mutable.ValidDynamicRefreshRates.push_back( pMode->vrefresh );
+			}
+			std::sort( m_Mutable.ValidDynamicRefreshRates.begin(), m_Mutable.ValidDynamicRefreshRates.end() );
+			if ( m_Mutable.ValidDynamicRefreshRates.size() > 1 )
+				drm_log.infof( "Connector %s: no EDID, %zu refresh rates from the panel mode list",
+					m_Mutable.szName, m_Mutable.ValidDynamicRefreshRates.size() );
+		};
+
 		if ( !GetProperties().EDID )
+		{
+			collectModeRefreshRates();
 			return;
+		}
 
 		uint64_t ulBlobId = GetProperties().EDID->GetCurrentValue();
 		if ( !ulBlobId )
+		{
+			collectModeRefreshRates();
 			return;
+		}
 
 		drmModePropertyBlobRes *pBlob = drmModeGetPropertyBlob( g_DRM.fd, ulBlobId );
 		if ( !pBlob )
+		{
+			collectModeRefreshRates();
 			return;
+		}
 		defer( drmModeFreePropertyBlob( pBlob ) );
 
 		const uint8_t *pDataPointer = reinterpret_cast<const uint8_t *>( pBlob->data );
@@ -2545,6 +2673,7 @@ namespace gamescope
 		if ( !pInfo )
 		{
 			drm_log.errorf( "Failed to parse edid for connector: %s", m_Mutable.szName );
+			collectModeRefreshRates();
 			return;
 		}
 		defer( di_info_destroy( pInfo ) );
@@ -3686,6 +3815,10 @@ bool drm_set_mode( struct drm_t *drm, const drmModeModeInfo *mode )
 		if ( g_bForceCompositionRotation || !bScanoutCanRotate )
 			g_uOutputRotation = uStep;
 	}
+	drm_log.infof( "orientation=%d rotated=%d logical=%dx%d mode=%dx%d@%u composition_rotation=%u",
+		(int)drm->pConnector->GetCurrentOrientation(), (int)g_bRotated,
+		g_nOutputWidth, g_nOutputHeight, mode->hdisplay, mode->vdisplay,
+		mode->vrefresh, g_uOutputRotation );
 
 	return true;
 }
@@ -3929,10 +4062,13 @@ namespace gamescope
 			bNeedsFullComposite |= pFrameInfo->useSGSRLayer0;
 			bNeedsFullComposite |= pFrameInfo->blurLayer0;
 			bNeedsFullComposite |= bNeedsCompositeFromFilter;
+			// konkr: MSM plane scaling of 720p->1080p flickers / fails. Blit in Vulkan.
+			bNeedsFullComposite |= !bLayer0ScreenSize;
 			bNeedsFullComposite |= !cv_drm_cursor_plane && bDrewCursor;
 			bNeedsFullComposite |= g_bColorSliderInUse;
 			bNeedsFullComposite |= pFrameInfo->bFadingOut;
 			bNeedsFullComposite |= !g_reshade_effect.empty();
+			bNeedsFullComposite |= steamcompmgr_has_night_rgb_ctm();
 
 			if ( g_bOutputHDREnabled )
 			{
@@ -4255,12 +4391,21 @@ namespace gamescope
 
 			if ( eScreenType == GAMESCOPE_SCREEN_TYPE_INTERNAL )
 			{
+				gamescope::CDRMConnector *pBest = nullptr;
+				uint32_t uBestArea = 0;
 				for ( auto &iter : g_DRM.connectors )
 				{
 					gamescope::CDRMConnector *pConnector = &iter.second;
-					if ( pConnector->GetScreenType() == GAMESCOPE_SCREEN_TYPE_INTERNAL )
-						return pConnector;
+					if ( pConnector->GetScreenType() != GAMESCOPE_SCREEN_TYPE_INTERNAL )
+						continue;
+					const uint32_t uArea = connector_mode_area( pConnector );
+					if ( !pBest || uArea > uBestArea )
+					{
+						pBest = pConnector;
+						uBestArea = uArea;
+					}
 				}
+				return pBest;
 			}
 
 			return nullptr;

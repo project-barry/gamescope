@@ -152,6 +152,7 @@ struct xwayland_ctx_t final : public gamescope::IWaitable
 		Atom gamescopeFocusedAppAtom;
 		Atom gamescopeFocusedAppGfxAtom;
 		Atom gamescopeCtrlAppIDAtom;
+		Atom konkrAndroidAppIDAtom;
 		Atom gamescopeCtrlWindowAtom;
 		Atom gamescopeInputCounterAtom;
 		Atom gamescopeScreenShotAtom;
@@ -215,6 +216,7 @@ struct xwayland_ctx_t final : public gamescope::IWaitable
 		Atom gamescopeDebugHDRHeatmap_MSWCG;
 		Atom gamescopeHDROutputFeedback;
 		Atom gamescopeSDROnHDRContentBrightness;
+		Atom gamescopeInternalDisplayBrightness;
 		Atom gamescopeHDRInputGain;
 		Atom gamescopeSDRInputGain;
 		Atom gamescopeHDRItmEnable;

@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <stddef.h>
 
 #include "wlr_begin.hpp"
 #include <wlr/types/wlr_buffer.h>
@@ -201,3 +202,8 @@ MouseCursor *steamcompmgr_get_server_cursor(uint32_t serverId);
 extern gamescope::ConVar<bool> cv_tearing_enabled;
 
 extern void steamcompmgr_set_app_refresh_cycle_override( gamescope::GamescopeScreenType type, int override_fps, bool change_refresh, bool change_fps_cap );
+
+// Steam X11/wlr-gamma night mode → RGB scale applied as a 3x4 CTM in the blit.
+void steamcompmgr_set_night_rgb_scale( float r, float g, float b, bool bFromWlrGamma );
+void steamcompmgr_set_night_rgb_from_gamma_ramp( const uint16_t *r, const uint16_t *g, const uint16_t *b, size_t n, bool bFromWlrGamma );
+bool steamcompmgr_has_night_rgb_ctm();

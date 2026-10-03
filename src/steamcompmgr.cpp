@@ -31,6 +31,7 @@
 
 #include "backend.h"
 #include "gamescope_shared.h"
+#include "backlight.hpp"
 #include "xwayland_ctx.hpp"
 #include <X11/X.h>
 #include <X11/Xlib.h>
@@ -44,9 +45,11 @@
 #include <mutex>
 #include <atomic>
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <fstream>
 #include <iterator>
+#include <sstream>
 #include <string>
 #include <filesystem>
 #include <unordered_map>
@@ -168,6 +171,258 @@ extern float g_flHDRItmTargetNits;
 uint64_t g_lastWinSeq = 0;
 
 static std::shared_ptr<gamescope::BackendBlob> s_scRGB709To2020Matrix;
+static std::shared_ptr<gamescope::BackendBlob> s_NightRgbCtmBlob;
+static glm::vec3 s_vecNightRgbScale{ 1.f, 1.f, 1.f };
+static std::atomic<float> s_flNightRgbR{ 1.f };
+static std::atomic<float> s_flNightRgbG{ 1.f };
+static std::atomic<float> s_flNightRgbB{ 1.f };
+static std::atomic<bool> s_bNightFromWlrGamma{ false };
+static std::atomic<bool> s_bSteamWroteNightMode{ false };
+
+bool set_color_nightmode( const nightmode_t &nightmode );
+bool set_color_mgmt_enabled( bool bEnabled );
+
+static glm::vec3
+night_rgb_scale_from_ramp( const uint16_t *r, const uint16_t *g, const uint16_t *b, int nSize )
+{
+	auto scale_at = [&]( int i ) -> glm::vec3
+	{
+		const float flIdent = 65535.f * float( i ) / float( nSize - 1 );
+		if ( flIdent < 16.f )
+			return glm::vec3( 1.f );
+		return glm::vec3( r[i] / flIdent, g[i] / flIdent, b[i] / flIdent );
+	};
+
+	glm::vec3 scale = scale_at( nSize - 1 );
+	if ( fabsf( scale.r - 1.f ) + fabsf( scale.g - 1.f ) + fabsf( scale.b - 1.f ) < 0.02f )
+		scale = scale_at( ( nSize - 1 ) * 3 / 4 );
+	return glm::clamp( scale, glm::vec3( 0.f ), glm::vec3( 1.5f ) );
+}
+
+void
+steamcompmgr_set_night_rgb_scale( float r, float g, float b, bool bFromWlrGamma )
+{
+	glm::vec3 scale = glm::clamp( glm::vec3( r, g, b ), glm::vec3( 0.f ), glm::vec3( 1.5f ) );
+	const bool bIdentity =
+		fabsf( scale.r - 1.f ) + fabsf( scale.g - 1.f ) + fabsf( scale.b - 1.f ) < 0.02f;
+
+	if ( bFromWlrGamma )
+		s_bNightFromWlrGamma.store( !bIdentity, std::memory_order_relaxed );
+
+	const float flOldR = s_flNightRgbR.load( std::memory_order_relaxed );
+	const float flOldG = s_flNightRgbG.load( std::memory_order_relaxed );
+	const float flOldB = s_flNightRgbB.load( std::memory_order_relaxed );
+	if ( fabsf( scale.r - flOldR ) + fabsf( scale.g - flOldG ) + fabsf( scale.b - flOldB ) < 0.008f )
+		return;
+
+	s_flNightRgbR.store( scale.r, std::memory_order_relaxed );
+	s_flNightRgbG.store( scale.g, std::memory_order_relaxed );
+	s_flNightRgbB.store( scale.b, std::memory_order_relaxed );
+	force_repaint();
+}
+
+void
+steamcompmgr_set_night_rgb_from_gamma_ramp( const uint16_t *r, const uint16_t *g, const uint16_t *b, size_t n, bool bFromWlrGamma )
+{
+	if ( !r || !g || !b || n < 8 )
+	{
+		steamcompmgr_set_night_rgb_scale( 1.f, 1.f, 1.f, bFromWlrGamma );
+		return;
+	}
+	glm::vec3 scale = night_rgb_scale_from_ramp( r, g, b, int( n ) );
+	steamcompmgr_set_night_rgb_scale( scale.r, scale.g, scale.b, bFromWlrGamma );
+}
+
+bool
+steamcompmgr_has_night_rgb_ctm()
+{
+	return s_NightRgbCtmBlob != nullptr;
+}
+
+static void
+sync_night_rgb_ctm_blob()
+{
+	glm::vec3 scale{
+		s_flNightRgbR.load( std::memory_order_relaxed ),
+		s_flNightRgbG.load( std::memory_order_relaxed ),
+		s_flNightRgbB.load( std::memory_order_relaxed ),
+	};
+	if ( fabsf( scale.r - s_vecNightRgbScale.r ) +
+	     fabsf( scale.g - s_vecNightRgbScale.g ) +
+	     fabsf( scale.b - s_vecNightRgbScale.b ) < 0.008f )
+		return;
+
+	s_vecNightRgbScale = scale;
+	const bool bIdentity =
+		fabsf( scale.r - 1.f ) + fabsf( scale.g - 1.f ) + fabsf( scale.b - 1.f ) < 0.02f;
+	if ( bIdentity )
+	{
+		s_NightRgbCtmBlob = nullptr;
+		xwm_log.infof( "Night tint cleared" );
+	}
+	else
+	{
+		glm::mat3x4 m{
+			scale.r, 0.f,     0.f,     0.f,
+			0.f,     scale.g, 0.f,     0.f,
+			0.f,     0.f,     scale.b, 0.f,
+		};
+		s_NightRgbCtmBlob = GetBackend()->CreateBackendBlob( m );
+		xwm_log.infof( "Night tint: r=%.3f g=%.3f b=%.3f", scale.r, scale.g, scale.b );
+	}
+}
+
+// Steam Game Mode night toggle (display manager "X11") never reaches
+// GAMESCOPE_COLOR_NIGHT_MODE. Follow CSystemManager's live log only.
+// Do not seed from config.vdf: DisplayNightModeOverrideValue=1 ("until
+// morning") stays set across reboot while Steam starts with
+// "Night mode active on resume 0" and the QAM toggle off.
+static std::filesystem::path
+steam_home_file( const char *rel )
+{
+	const char *pszHome = getenv( "HOME" );
+	if ( !pszHome || !*pszHome )
+		return {};
+	return std::filesystem::path( pszHome ) / rel;
+}
+
+static std::string
+read_file_from_offset( const std::filesystem::path &path, uintmax_t off )
+{
+	std::ifstream in( path, std::ios::binary );
+	if ( !in )
+		return {};
+	in.seekg( std::streamoff( off ) );
+	std::stringstream ss;
+	ss << in.rdbuf();
+	return ss.str();
+}
+
+// -1 unknown, 0 off, 1 on
+static int
+night_mode_from_log_chunk( const std::string &chunk )
+{
+	size_t bestPos = std::string::npos;
+	int nState = -1;
+	auto consider = [&]( size_t pos, int on )
+	{
+		if ( pos != std::string::npos && ( bestPos == std::string::npos || pos > bestPos ) )
+		{
+			bestPos = pos;
+			nState = on;
+		}
+	};
+
+	consider( chunk.rfind( "Enabling night mode" ), 1 );
+	consider( chunk.rfind( "Disabling night mode" ), 0 );
+
+	const char *pszResume = "Night mode active on resume ";
+	auto posResume = chunk.rfind( pszResume );
+	if ( posResume != std::string::npos )
+	{
+		size_t iDigit = posResume + strlen( pszResume );
+		int nResume = 0;
+		if ( iDigit < chunk.size() && chunk[ iDigit ] == '1' )
+			nResume = 1;
+		consider( posResume, nResume );
+	}
+
+	return nState;
+}
+
+static int
+night_mode_from_new_systemmanager_lines()
+{
+	std::filesystem::path path = steam_home_file( ".local/share/Steam/logs/systemmanager.txt" );
+	if ( path.empty() )
+		return -1;
+
+	std::error_code ec;
+	if ( !std::filesystem::exists( path, ec ) )
+		return -1;
+
+	uintmax_t cbSize = std::filesystem::file_size( path, ec );
+	if ( ec )
+		return -1;
+
+	static uintmax_t s_cbSeen = 0;
+	static bool s_bInit = false;
+	if ( !s_bInit )
+	{
+		// Ignore the previous boot's Enabling line; wait for this Steam run.
+		s_cbSeen = cbSize;
+		s_bInit = true;
+		return -1;
+	}
+	if ( cbSize < s_cbSeen )
+		s_cbSeen = 0;
+	if ( cbSize == s_cbSeen )
+		return -1;
+
+	std::string chunk = read_file_from_offset( path, s_cbSeen );
+	s_cbSeen = cbSize;
+	if ( chunk.empty() )
+		return -1;
+
+	return night_mode_from_log_chunk( chunk );
+}
+
+static bool
+steam_night_mode_enabled()
+{
+	static int s_nState = 0;
+
+	const int nLog = night_mode_from_new_systemmanager_lines();
+	if ( nLog >= 0 )
+		s_nState = nLog;
+
+	return s_nState == 1;
+}
+
+static void
+poll_x11_gamma_night_tint( xwayland_ctx_t *ctx )
+{
+	if ( s_bNightFromWlrGamma.load( std::memory_order_relaxed ) )
+		return;
+	// Steam's GAMESCOPE_COLOR_NIGHT_MODE already drives the LUT (sanitized).
+	// Once Steam has written a real night-mode atom, keep trusting it — including
+	// amount=0 on toggle-off — so the log fallback cannot re-apply a tint.
+	if ( s_bSteamWroteNightMode.load( std::memory_order_relaxed ) ||
+	     g_ColorMgmt.pending.nightmode.amount >= 0.01f )
+	{
+		steamcompmgr_set_night_rgb_scale( 1.f, 1.f, 1.f, false );
+		return;
+	}
+
+	static int s_nLastConfig = -1;
+	const bool bOn = steam_night_mode_enabled();
+	if ( (int)bOn != s_nLastConfig )
+	{
+		s_nLastConfig = (int)bOn;
+		xwm_log.infof( "Night mode from Steam: %s", bOn ? "on" : "off" );
+	}
+
+	// No RGB CTM: linear 3x4 scale reads as red. Use the same LUT as Deck.
+	steamcompmgr_set_night_rgb_scale( 1.f, 1.f, 1.f, false );
+	nightmode_t nightmode{};
+	if ( bOn )
+	{
+		nightmode.amount = 0.55f;
+		nightmode.hue = 0.08f;
+		nightmode.saturation = 0.40f;
+		if ( !g_ColorMgmt.pending.enabled )
+			set_color_mgmt_enabled( true );
+	}
+	set_color_nightmode( nightmode );
+}
+
+static void
+maybe_apply_night_rgb_ctm( FrameInfo_t::Layer_t *layer )
+{
+	if ( !layer || layer->ctm || !s_NightRgbCtmBlob )
+		return;
+	layer->ctm = s_NightRgbCtmBlob;
+}
 
 std::string clipboard;
 std::string primarySelection;
@@ -178,6 +433,7 @@ uint32_t g_reshade_technique_idx = 0;
 
 bool g_bSteamIsActiveWindow = false;
 bool g_bForceInternal = false;
+bool g_bForceInternalLocked = false;
 
 namespace gamescope
 {
@@ -361,7 +617,7 @@ create_color_mgmt_luts(const gamescope_color_mgmt_t& newColorMgmt, gamescope_col
 
 			if ( inputEOTF == EOTF_Gamma22 )
 			{
-				flGain = newColorMgmt.flSDRInputGain;
+				flGain = newColorMgmt.flSDRInputGain * newColorMgmt.flSoftwareBacklightGain;
 				if ( newColorMgmt.outputEncodingEOTF == EOTF_Gamma22 )
 				{
 					// G22 -> G22. Does not matter what the g22 mult is
@@ -594,6 +850,8 @@ update_color_mgmt()
 	if ( !GetBackend()->GetCurrentConnector() )
 		return;
 
+	g_ColorMgmt.pending.flSoftwareBacklightGain = gamescope::GetSoftwareBacklightGain();
+
 	GetBackend()->GetCurrentConnector()->GetNativeColorimetry(
 		g_bOutputHDREnabled,
 		&g_ColorMgmt.pending.displayColorimetry, &g_ColorMgmt.pending.displayEOTF,
@@ -734,14 +992,44 @@ bool set_sdr_input_gain( float flVal )
 	return g_ColorMgmt.pending.enabled;
 }
 
+static nightmode_t
+sanitize_nightmode( nightmode_t n )
+{
+	if ( !std::isfinite( n.amount ) || n.amount < 0.f )
+		n.amount = 0.f;
+	n.amount = glm::clamp( n.amount, 0.f, 1.f );
+
+	const bool bSatOk = std::isfinite( n.saturation ) && n.saturation >= 0.f && n.saturation <= 1.f;
+	if ( !bSatOk )
+		n.saturation = 0.40f;
+
+	if ( std::isfinite( n.hue ) )
+		n.hue = n.hue - floorf( n.hue );
+	else
+		n.hue = 0.08f;
+
+	// Steam's Wayland path sends hue≈0.95 (HSV red/magenta) plus a garbage
+	// saturation. X11 night light is amber (~30°). Keep orange-yellow hues.
+	if ( n.hue < 0.03f || n.hue > 0.22f )
+		n.hue = 0.08f;
+
+	return n;
+}
+
 bool set_color_nightmode( const nightmode_t &nightmode )
 {
-	if ( g_ColorMgmt.pending.nightmode == nightmode )
+	nightmode_t sanitized = sanitize_nightmode( nightmode );
+	if ( g_ColorMgmt.pending.nightmode == sanitized )
 		return false;
 
-	g_ColorMgmt.pending.nightmode = nightmode;
+	g_ColorMgmt.pending.nightmode = sanitized;
+	if ( sanitized.amount >= 0.01f && !g_ColorMgmt.pending.enabled )
+		g_ColorMgmt.pending.enabled = true;
+	xwm_log.infof( "Night mode: amount=%.3f hue=%.3f sat=%.3f color_mgmt=%d",
+		sanitized.amount, sanitized.hue, sanitized.saturation,
+		g_ColorMgmt.pending.enabled ? 1 : 0 );
 
-	return g_ColorMgmt.pending.enabled;
+	return true;
 }
 bool set_color_mgmt_enabled( bool bEnabled )
 {
@@ -1883,13 +2171,23 @@ static int32_t
 window_last_done_commit_index( steamcompmgr_win_t *w )
 {
 	int32_t lastCommit = -1;
+	int32_t lastOverrideCommit = -1;
+	struct wlr_surface *override = w ? w->override_surface() : nullptr;
 	for ( uint32_t i = 0; i < w->commit_queue.size(); i++ )
 	{
 		if ( w->commit_queue[ i ]->done )
 		{
 			lastCommit = i;
+			if ( override && w->commit_queue[ i ]->surf == override )
+				lastOverrideCommit = i;
 		}
 	}
+
+	// Gamescope WSI attaches a native swapchain (often 720p) as override_surface
+	// while Xwayland still commits a nested-sized pixmap. Prefer the swapchain
+	// or the image never fills the panel.
+	if ( lastOverrideCommit != -1 )
+		return lastOverrideCommit;
 
 	return lastCommit;
 }
@@ -1991,10 +2289,16 @@ void calc_scale_factor_scaler(GamescopeUpscaleScaler eScaler, float &out_scale_x
 
 	if (eScaler == GamescopeUpscaleScaler::INTEGER)
 	{
+		const float flFit = out_scale_x;
 		if (out_scale_x > 1.0f)
 		{
 			// x == y here always.
 			out_scale_x = out_scale_y = floor(out_scale_x);
+		}
+		// 720p→1080p is 1.5x: integer floors to 1 and leaves the panel unused.
+		if ( out_scale_x + 0.01f < flFit && flFit > 1.01f )
+		{
+			out_scale_x = out_scale_y = flFit;
 		}
 	}
 }
@@ -2637,14 +2941,22 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 
 		if ( fit )
 		{
-			// If we have an override window, try to fit it in as long as it won't make our scale go below 1.0.
-			int32_t fitX = fit->GetGeometry().nX - scaleW->GetGeometry().nX;
-			int32_t fitY = fit->GetGeometry().nY - scaleW->GetGeometry().nY;
-			sourceWidth = std::max<uint32_t>( sourceWidth, clamp<int>( fitX + fit->GetGeometry().nWidth, 0, currentOutputWidth ) );
-			sourceHeight = std::max<uint32_t>( sourceHeight, clamp<int>( fitY + fit->GetGeometry().nHeight, 0, currentOutputHeight ) );
+			// konkr: a nested-sized override is a fullscreen wrapper, not a dropdown;
+			// fitting it would stop 720p swapchains from scaling up.
+			const bool bFitIsNestedSized =
+				fit->GetGeometry().nWidth >= (int)currentOutputWidth - 2 &&
+				fit->GetGeometry().nHeight >= (int)currentOutputHeight - 2;
+			if ( !bFitIsNestedSized )
+			{
+				// If we have an override window, try to fit it in as long as it won't make our scale go below 1.0.
+				int32_t fitX = fit->GetGeometry().nX - scaleW->GetGeometry().nX;
+				int32_t fitY = fit->GetGeometry().nY - scaleW->GetGeometry().nY;
+				sourceWidth = std::max<uint32_t>( sourceWidth, clamp<int>( fitX + fit->GetGeometry().nWidth, 0, currentOutputWidth ) );
+				sourceHeight = std::max<uint32_t>( sourceHeight, clamp<int>( fitY + fit->GetGeometry().nHeight, 0, currentOutputHeight ) );
 
-			baseWidth = std::max<uint32_t>( baseWidth, clamp<int>( fitX + fit->GetGeometry().nWidth, 0, currentOutputWidth ) );
-			baseHeight = std::max<uint32_t>( baseHeight, clamp<int>( fitY + fit->GetGeometry().nHeight, 0, currentOutputHeight ) );
+				baseWidth = std::max<uint32_t>( baseWidth, clamp<int>( fitX + fit->GetGeometry().nWidth, 0, currentOutputWidth ) );
+				baseHeight = std::max<uint32_t>( baseHeight, clamp<int>( fitY + fit->GetGeometry().nHeight, 0, currentOutputHeight ) );
+			}
 		}
 	}
 
@@ -3117,6 +3429,15 @@ paint_all( global_focus_t *pFocus, bool async )
 
 	update_color_mgmt();
 
+	static uint32_t s_uLastNightPollMs = 0;
+	const uint32_t uNowMs = get_time_in_milliseconds();
+	if ( s_uLastNightPollMs == 0 || uNowMs - s_uLastNightPollMs >= 100 )
+	{
+		s_uLastNightPollMs = uNowMs;
+		poll_x11_gamma_night_tint( root_ctx );
+	}
+	sync_night_rgb_ctm_blob();
+
 	paintID++;
 	gpuvis_trace_begin_ctx_printf( paintID, "paint_all" );
 	steamcompmgr_win_t	*w;
@@ -3499,6 +3820,12 @@ paint_all( global_focus_t *pFocus, bool async )
 			frameInfo.shaperLut[i] = g_ColorMgmtLuts[i].vk_lut1d;
 			frameInfo.lut3D[i] = g_ColorMgmtLuts[i].vk_lut3d;
 		}
+	}
+
+	if ( s_NightRgbCtmBlob && g_ColorMgmt.pending.nightmode.amount < 0.01f )
+	{
+		for ( int i = 0; i < frameInfo.layers.count(); i++ )
+			maybe_apply_night_rgb_ctm( &frameInfo.layers.get( i ) );
 	}
 
 	if ( pConnector && pConnector->Present( &frameInfo, async ) != 0 )
@@ -4973,12 +5300,19 @@ const char *get_win_display_name(steamcompmgr_win_t *window)
 }
 
 
+// konkr: Steam app id that currently owns the shared Android window, set by
+// konkr-apk on the root window before it starts an app.
+static uint32_t g_unKonkrAndroidAppId = 0;
+
 static std::vector< steamcompmgr_win_t* >
 steamcompmgr_xdg_get_possible_focus_windows()
 {
 	std::vector< steamcompmgr_win_t* > windows;
 	for ( auto &win : g_steamcompmgr_xdg_wins )
 	{
+		if ( win->bKonkrAndroid )
+			win->appID = g_unKonkrAndroidAppId;
+
 		// Always skip system tray icons and overlays
 		if ( win->isSysTrayIcon || win->isOverlay || win->isExternalOverlay )
 		{
@@ -5134,7 +5468,21 @@ determine_and_apply_focus( global_focus_t *pFocus )
 	for ( steamcompmgr_win_t *focusable_window : vecPossibleFocusWindows )
 	{
 		if ( focusable_window->type != steamcompmgr_win_type_t::XWAYLAND )
+		{
+			// konkr: report xdg-shell apps (e.g. Lepton's Android window) too, or
+			// Steam never sees the game's window and keeps its launch screen up.
+			uint32_t unXdgAppID = focusable_window->appID;
+			if ( focusable_window->type == steamcompmgr_win_type_t::XDG && unXdgAppID != 0 )
+			{
+				if ( std::find( focusable_appids.begin(), focusable_appids.end(), unXdgAppID ) == focusable_appids.end() )
+					focusable_appids.push_back( unXdgAppID );
+				// xdg ids are small serials, X11 ids never are
+				focusable_windows.push_back( focusable_window->xdg().id );
+				focusable_windows.push_back( unXdgAppID );
+				focusable_windows.push_back( focusable_window->pid );
+			}
 			continue;
+		}
 
 		// Exclude windows that are useless (1x1), skip taskbar + pager or override redirect windows
 		// from the reported focusable windows to Steam.
@@ -6970,6 +7318,11 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 		get_prop( ctx, ctx->root, ctx->atoms.gamescopeCtrlAppIDAtom, vecFocuscontrolAppIDs );
 		MakeFocusDirty();
 	}
+	if ( ev->atom == ctx->atoms.konkrAndroidAppIDAtom )
+	{
+		g_unKonkrAndroidAppId = get_prop( ctx, ctx->root, ctx->atoms.konkrAndroidAppIDAtom, 0 );
+		MakeFocusDirty();
+	}
 	if (ev->atom == ctx->atoms.gamescopeCtrlWindowAtom )
 	{
 		ctx->focusControlWindow = get_prop( ctx, ctx->root, ctx->atoms.gamescopeCtrlWindowAtom, None );
@@ -7325,8 +7678,13 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 	}
 	if ( ev->atom == ctx->atoms.gamescopeDisplayForceInternal )
 	{
-		g_bForceInternal = !!get_prop( ctx, ctx->root, ctx->atoms.gamescopeDisplayForceInternal, 0 );
-		GetBackend()->DirtyState();
+		// --force-internal / GAMESCOPE_FORCE_INTERNAL locks the handheld panel.
+		// Ignore Steam's "use TV" atom so HDMI/DP cannot steal the DSI screen.
+		if ( !g_bForceInternalLocked )
+		{
+			g_bForceInternal = !!get_prop( ctx, ctx->root, ctx->atoms.gamescopeDisplayForceInternal, 0 );
+			GetBackend()->DirtyState();
+		}
 	}
 	if ( ev->atom == ctx->atoms.gamescopeDisplayModeNudge )
 	{
@@ -7428,6 +7786,22 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 		uint32_t val = get_prop( ctx, ctx->root, ctx->atoms.gamescopeSDROnHDRContentBrightness, 0 );
 		if ( set_sdr_on_hdr_brightness( bit_cast<float>(val) ) )
 			hasRepaint = true;
+	}
+	if ( ev->atom == ctx->atoms.gamescopeInternalDisplayBrightness )
+	{
+		uint32_t val = get_prop( ctx, ctx->root, ctx->atoms.gamescopeInternalDisplayBrightness, 0 );
+		const float flVal = bit_cast<float>( val );
+		if ( gamescope::ApplySteamBrightnessValue( flVal ) )
+		{
+			const float flGain = gamescope::GetSoftwareBacklightGain();
+			if ( g_ColorMgmt.pending.flSoftwareBacklightGain != flGain )
+			{
+				g_ColorMgmt.pending.flSoftwareBacklightGain = flGain;
+				hasRepaint = true;
+			}
+			if ( set_internal_display_brightness( flVal < 1.f ? 500.f * std::max( flVal, 0.01f ) : flVal ) )
+				hasRepaint = true;
+		}
 	}
 	if ( ev->atom == ctx->atoms.gamescopeHDRItmEnable )
 	{
@@ -7540,6 +7914,9 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 		nightmode.hue = vec[1];
 		nightmode.saturation = vec[2];
 
+		if ( std::isfinite( nightmode.amount ) && nightmode.amount >= 0.01f )
+			s_bSteamWroteNightMode.store( true, std::memory_order_relaxed );
+
 		if ( set_color_nightmode( nightmode ) )
 			hasRepaint = true;
 	}
@@ -7547,7 +7924,10 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 	{
 		uint32_t val = get_prop(ctx, ctx->root, ctx->atoms.gamescopeColorManagementDisable, 0);
 		if ( set_color_mgmt_enabled( !val ) )
+		{
+			xwm_log.infof( "Color management %s by Steam", val ? "disabled" : "enabled" );
 			hasRepaint = true;
+		}
 	}
 	if ( ev->atom == ctx->atoms.gamescopeColorSliderInUse )
 	{
@@ -8325,7 +8705,9 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 
 	// If we have an override surface, make sure this commit is for the current surface
 	// or if the commit is probably bogus.
-	bool bOnlyCurrentSurface = w->bHasHadNonSRGBColorSpace || bPossiblyBogus || !bHasDamage || cv_surface_update_force_only_current_surface;
+	// Always ignore X/glamor pixmaps while WSI override is active: a 1080p
+	// X window around a 720p swapchain otherwise becomes the base plane.
+	bool bOnlyCurrentSurface = w->bHasHadNonSRGBColorSpace || bPossiblyBogus || !bHasDamage || cv_surface_update_force_only_current_surface || w->override_surface() != nullptr;
 
 	bool for_current_surface = !w->override_surface() || w->current_surface() == reslistentry.surf;
 
@@ -8940,6 +9322,7 @@ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_
 	ctx->atoms.gamescopeFocusedAppGfxAtom = XInternAtom( ctx->dpy, "GAMESCOPE_FOCUSED_APP_GFX", false );
 	ctx->atoms.gamescopeFocusedWindowAtom = XInternAtom( ctx->dpy, "GAMESCOPE_FOCUSED_WINDOW", false );
 	ctx->atoms.gamescopeCtrlAppIDAtom = XInternAtom(ctx->dpy, "GAMESCOPECTRL_BASELAYER_APPID", false);
+	ctx->atoms.konkrAndroidAppIDAtom = XInternAtom(ctx->dpy, "KONKR_ANDROID_APPID", false);
 	ctx->atoms.gamescopeCtrlWindowAtom = XInternAtom(ctx->dpy, "GAMESCOPECTRL_BASELAYER_WINDOW", false);
 	ctx->atoms.WMChangeStateAtom = XInternAtom(ctx->dpy, "WM_CHANGE_STATE", false);
 	ctx->atoms.gamescopeInputCounterAtom = XInternAtom(ctx->dpy, "GAMESCOPE_INPUT_COUNTER", false);
@@ -9003,6 +9386,7 @@ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_
 	ctx->atoms.gamescopeDebugHDRHeatmap = XInternAtom( ctx->dpy, "GAMESCOPE_DEBUG_HDR_HEATMAP", false );
 	ctx->atoms.gamescopeHDROutputFeedback = XInternAtom( ctx->dpy, "GAMESCOPE_HDR_OUTPUT_FEEDBACK", false );
 	ctx->atoms.gamescopeSDROnHDRContentBrightness = XInternAtom( ctx->dpy, "GAMESCOPE_SDR_ON_HDR_CONTENT_BRIGHTNESS", false );
+	ctx->atoms.gamescopeInternalDisplayBrightness = XInternAtom( ctx->dpy, "GAMESCOPE_INTERNAL_DISPLAY_BRIGHTNESS", false );
 	ctx->atoms.gamescopeHDRInputGain = XInternAtom( ctx->dpy, "GAMESCOPE_HDR_INPUT_GAIN", false );
 	ctx->atoms.gamescopeSDRInputGain = XInternAtom( ctx->dpy, "GAMESCOPE_SDR_INPUT_GAIN", false );
 	ctx->atoms.gamescopeHDRItmEnable = XInternAtom( ctx->dpy, "GAMESCOPE_HDR_ITM_ENABLE", false );
@@ -9073,6 +9457,15 @@ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_
 
 	uint32_t uLimiterFeedback = wlserver_get_frame_limiter_state();
 	XChangeProperty(ctx->dpy, ctx->root, ctx->atoms.gamescopeLimiterFeedback, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&uLimiterFeedback, 1 );
+
+	// Seed so Steam can write GAMESCOPE_COLOR_NIGHT_MODE if it uses that path,
+	// and so steamui stops failing to read HDR feedback.
+	uint32_t unNightModeIdentity[3] = { 0, 0, 0 };
+	XChangeProperty(ctx->dpy, ctx->root, ctx->atoms.gamescopeColorNightMode, XA_CARDINAL, 32, PropModeReplace,
+		(unsigned char *)unNightModeIdentity, 3 );
+	uint32_t unAppWantsHDR = 0;
+	XChangeProperty(ctx->dpy, ctx->root, ctx->atoms.gamescopeColorAppWantsHDRFeedback, XA_CARDINAL, 32, PropModeReplace,
+		(unsigned char *)&unAppWantsHDR, 1 );
 
 	XGrabServer(ctx->dpy);
 

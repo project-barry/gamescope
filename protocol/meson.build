@@ -45,6 +45,7 @@ protocols = [
 
 	# wlroots protocols
 	'wlr-layer-shell-unstable-v1.xml',
+	'wlr-gamma-control-unstable-v1.xml',
 ]
 
 protocols_client_src = []

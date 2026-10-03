@@ -26,6 +26,8 @@ extern bool g_bForceRelativeMouse;
 extern int g_nOutputRefresh; // mHz
 extern bool g_bOutputHDREnabled;
 extern bool g_bForceInternal;
+extern bool g_bForceInternalLocked;
+
 
 extern bool g_bForceCompositionRotation;
 extern uint32_t g_uOutputRotation;
