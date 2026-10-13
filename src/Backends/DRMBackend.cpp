@@ -4956,7 +4956,17 @@ namespace gamescope
 				return false;
 			}
 
-			return init_drm( &g_DRM, g_nPreferredOutputWidth, g_nPreferredOutputHeight, g_nNestedRefresh );
+			if ( !init_drm( &g_DRM, g_nPreferredOutputWidth, g_nPreferredOutputHeight, g_nNestedRefresh ) )
+				return false;
+
+			// On a real display, -r only picks the mode to start in, and
+			// init_drm keeps it as the preferred refresh. Left set, it would
+			// stand in for the panel's rate after every mode change: the frame
+			// limiter, the vblank timer and the refresh cycle games are given
+			// stayed at the starting rate (60 FPS on a 120 Hz panel, caps that
+			// did nothing).
+			g_nNestedRefresh = 0;
+			return true;
 		}
 
 		virtual bool PostInit() override
