@@ -286,6 +286,15 @@ namespace GamescopeWSILayer {
     return s_execName;
   }
 
+  // Steam's own UI (steamwebhelper) inherits ENABLE_GAMESCOPE_WSI from Steam,
+  // like the games Steam starts. Where it draws through Vulkan (ANGLE-Vulkan
+  // or zink rather than a native GL driver, as on ARM), bypassing XWayland
+  // took its windows away from gamescope: the Steam menu and Quick Access no
+  // longer opened. Leave it on XWayland.
+  static bool isSteamClientUI() {
+    return getExecutableName() == "steamwebhelper"sv;
+  }
+
   static GamescopeLayerClient::Flags defaultLayerClientFlags(const VkApplicationInfo *pApplicationInfo, uint32_t appid) {
     GamescopeLayerClient::Flags flags = 0;
 
@@ -671,7 +680,7 @@ namespace GamescopeWSILayer {
             VkInstance*            pInstance) {
       // If we are an app running under gamescope and we aren't gamescope itself,
       // then setup our state for xwayland bypass.
-      if (!isRunningUnderGamescope() || isAppInfoGamescope(pCreateInfo->pApplicationInfo))
+      if (!isRunningUnderGamescope() || isAppInfoGamescope(pCreateInfo->pApplicationInfo) || isSteamClientUI())
         return pfnCreateInstanceProc(pCreateInfo, pAllocator, pInstance);
 
       auto enabledExts = std::vector<const char*>(
@@ -1205,6 +1214,10 @@ namespace GamescopeWSILayer {
             VkSwapchainKHR*            pSwapchain) {
       auto gamescopeSurface = GamescopeSurface::get(pCreateInfo->surface);
 
+      // Steam's UI never got a gamescope instance (see isSteamClientUI).
+      if (!gamescopeSurface && isSteamClientUI())
+        return pDispatch->CreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+
       if (!gamescopeSurface) {
         static bool s_warned = false;
         if (!s_warned) {
@@ -1462,6 +1475,9 @@ namespace GamescopeWSILayer {
       const vkroots::VkDeviceDispatch* pDispatch,
             VkQueue                    queue,
       const VkPresentInfoKHR*          pPresentInfo) {
+      if (isSteamClientUI())
+        return pDispatch->QueuePresentKHR(queue, pPresentInfo);
+
       VkPresentInfoKHR presentInfo = *pPresentInfo;
 
       auto pPresentTimes = vkroots::FindInChain<const VkPresentTimesInfoGOOGLE>(&presentInfo);
