@@ -189,7 +189,16 @@ void mangoapp_post_control( uint32_t uMsgType, uint8_t uNoDisplay, bool bStartLo
         s_PendingControl.push_back(pending);
 }
 
+extern const char *g_sDrmLeaseClientSocket;
+
 void mangoapp_update( uint64_t visible_frametime, uint64_t app_frametime_ns, uint64_t latency_ns, uint32_t uMsgType ) {
+    // A lease client (the AYN Thor's bottom screen) shares the one queue
+    // ftok("mangoapp") gives every gamescope with the lessor, whose mangoapp
+    // would draw its frame times as the game's: Steam's overlay spiked with
+    // every finger move on the bottom screen.
+    if (g_sDrmLeaseClientSocket)
+        return;
+
     if (!inited)
         init_mangoapp();
 
@@ -261,15 +270,22 @@ extern void stats_report_app_fps( float fps );
 
 void mangoapp_output_update( uint64_t vblanktime )
 {
+	// Only a base-plane commit newer than any shown before is a new frame
+	// (commit IDs only grow, commit.cpp), so going back to an older commit
+	// isn't counted. Counting every change read 75-90 fps at a 30 FPS limit
+	// during pointer moves and bottom-screen touches on an AYN Thor, while
+	// DXVK's HUD showed the game drawing 30.
+	static uint64_t s_uNewestCommitID = 0;
+	const bool bNewFrame = g_uCurrentBasePlaneCommitID > s_uNewestCommitID;
+	if ( bNewFrame )
+		s_uNewestCommitID = g_uCurrentBasePlaneCommitID;
+
 	// Game frame rate for the stats pipe (the AYN Thor bottom-screen
 	// dashboard): new base-plane commits reaching the screen per second, the
 	// same signal mangoapp's frame times come from.
-	static uint64_t s_uFpsCommitID = 0, s_uFpsFrames = 0, s_uFpsStart = 0;
-	if ( s_uFpsCommitID != g_uCurrentBasePlaneCommitID )
-	{
-		s_uFpsCommitID = g_uCurrentBasePlaneCommitID;
+	static uint64_t s_uFpsFrames = 0, s_uFpsStart = 0;
+	if ( bNewFrame )
 		s_uFpsFrames++;
-	}
 	if ( !s_uFpsStart || vblanktime < s_uFpsStart )
 		s_uFpsStart = vblanktime;
 	else if ( vblanktime - s_uFpsStart >= 1'000'000'000ull )
@@ -279,14 +295,12 @@ void mangoapp_output_update( uint64_t vblanktime )
 		s_uFpsStart = vblanktime;
 	}
 
-	static uint64_t s_uLastBasePlaneCommitID = 0;
-	if ( s_uLastBasePlaneCommitID != g_uCurrentBasePlaneCommitID )
+	if ( bNewFrame )
 	{
 		static uint64_t s_uLastBasePlaneUpdateVBlankTime = vblanktime;
         uint64_t last_frametime = s_uLastBasePlaneUpdateVBlankTime;
         uint64_t frametime = vblanktime - last_frametime;
 		s_uLastBasePlaneUpdateVBlankTime = vblanktime;
-		s_uLastBasePlaneCommitID = g_uCurrentBasePlaneCommitID;
         if ( last_frametime > vblanktime )
             return;
 
