@@ -161,7 +161,7 @@ struct xwayland_ctx_t final : public gamescope::IWaitable
 		Atom gamescopeFocusedAppAtom;
 		Atom gamescopeFocusedAppGfxAtom;
 		Atom gamescopeCtrlAppIDAtom;
-		Atom konkrAndroidAppIDAtom;
+		Atom pbosAndroidAppIDAtom;
 		Atom gamescopeCtrlWindowAtom;
 		Atom gamescopeInputCounterAtom;
 		Atom gamescopeScreenShotAtom;

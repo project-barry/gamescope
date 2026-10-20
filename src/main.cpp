@@ -855,7 +855,7 @@ int main(int argc, char **argv)
 					g_bForceInternal = true;
 					g_bForceInternalLocked = true;
 				} else if (strcmp(opt_name, "use-rotation-shader") == 0) {
-					// konkr: older name for --force-composition-rotation (session scripts use it)
+					// pb-os: older name for --force-composition-rotation (session scripts use it)
 					g_bForceCompositionRotation = true;
 				} else if (strcmp(opt_name, "immediate-flips") == 0) {
 					cv_tearing_enabled = true;

@@ -1501,7 +1501,7 @@ static bool setup_best_connector(struct drm_t *drm, bool force, bool initial)
 		drm_unset_mode(drm, force);
 		s_HeadlessConnector.RebuildModes();
 
-		// konkr: panels without a physical size (EDID-less DSI) get GAMESCOPE_FAKE_OUTPUT_MM.
+		// pb-os: panels without a physical size (EDID-less DSI) get GAMESCOPE_FAKE_OUTPUT_MM.
 		int physW = 0, physH = 0;
 		get_wl_output_phys_mm( 0, 0, &physW, &physH );
 
@@ -2706,7 +2706,7 @@ static void update_drm_effective_orientations( struct drm_t *drm, const drmModeM
 		pDRMExternalConnector->UpdateEffectiveOrientation( pExternalMode );
 	}
 
-	// konkr: MSM/Adreno advertises plane rotation but rejects it (EINVAL on a
+	// pb-os: MSM/Adreno advertises plane rotation but rejects it (EINVAL on a
 	// 1-layer flip → backlight on, no image), so upstream's scanout-rotation
 	// autodetect would pick it. Rotate in the compositor instead.
 	// Override with GAMESCOPE_KMS_ROTATION=1 on GPUs that can rotate in hardware.
@@ -5045,7 +5045,7 @@ namespace gamescope
 			bNeedsFullComposite |= pFrameInfo->useSGSRLayer0;
 			bNeedsFullComposite |= pFrameInfo->blurLayer0;
 			bNeedsFullComposite |= bNeedsCompositeFromFilter;
-			// konkr: MSM plane scaling of 720p->1080p flickers / fails. Blit in Vulkan.
+			// pb-os: MSM plane scaling of 720p->1080p flickers / fails. Blit in Vulkan.
 			bNeedsFullComposite |= !bLayer0ScreenSize;
 			bNeedsFullComposite |= !cv_drm_cursor_plane && bDrewCursor;
 			bNeedsFullComposite |= g_bColorSliderInUse;

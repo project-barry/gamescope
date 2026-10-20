@@ -115,8 +115,8 @@ struct steamcompmgr_win_t {
 	uint32_t inputFocusMode = 0;
 	uint32_t appID = 0;
 	uint32_t steamAppID = 0;
-	// konkr: xdg window from konkr-android.service; appID follows KONKR_ANDROID_APPID
-	bool bKonkrAndroid = false;
+	// pb-os: xdg window from pbos-android.service; appID follows PBOS_ANDROID_APPID
+	bool bPbosAndroid = false;
 	bool isOverlay = false;
 	// GAMESCOPE_BOTTOM_SCREEN: drawn on the leased panel (the AYN Thor's
 	// bottom screen), never on the main output or focused there.

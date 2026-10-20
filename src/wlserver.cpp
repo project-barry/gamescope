@@ -2769,10 +2769,10 @@ void xdg_toplevel_new(struct wl_listener *listener, void *data)
 }
 
 
-// konkr: Lepton (Android) draws from a podman container, outside Steam's
+// pb-os: Lepton (Android) draws from a podman container, outside Steam's
 // reaper tree, so get_appid_from_pid finds nothing. A per-app launch still
 // runs in the launch's systemd scope (app-steam-app<N>-<pid>.scope); the
-// shared konkr-android.service window follows KONKR_ANDROID_APPID instead.
+// shared pbos-android.service window follows PBOS_ANDROID_APPID instead.
 static uint32_t get_container_appid( pid_t pid, steamcompmgr_win_t *window )
 {
 	char path[64];
@@ -2785,8 +2785,8 @@ static uint32_t get_container_appid( pid_t pid, steamcompmgr_win_t *window )
 		uint32_t unAppId = 0;
 		if ( nPos != std::string::npos && sscanf( line.c_str() + nPos, "app-steam-app%u", &unAppId ) == 1 && unAppId )
 			return unAppId;
-		if ( line.find( "konkr-android.service" ) != std::string::npos )
-			window->bKonkrAndroid = true;
+		if ( line.find( "pbos-android.service" ) != std::string::npos )
+			window->bPbosAndroid = true;
 	}
 	return 0;
 }
@@ -4028,14 +4028,14 @@ static void apply_touchscreen_orientation(GamescopePanelOrientation orientation,
 	*y = ty;
 }
 
-// konkr: Android (Lepton) wants real touch — scrolling, swipes, pinch — not
+// pb-os: Android (Lepton) wants real touch — scrolling, swipes, pinch — not
 // Steam's click emulation, which non-Steam titles get by default.
 static gamescope::TouchClickMode wlserver_touch_click_mode()
 {
 	if ( wlserver.mouse_focus_surface != NULL )
 	{
 		wlserver_wl_surface_info *info = get_wl_surface_info( wlserver.mouse_focus_surface );
-		if ( info && info->xdg_surface && info->xdg_surface->win && info->xdg_surface->win->bKonkrAndroid )
+		if ( info && info->xdg_surface && info->xdg_surface->win && info->xdg_surface->win->bPbosAndroid )
 			return gamescope::TouchClickModes::Passthrough;
 	}
 	return GetBackend()->GetTouchClickMode();

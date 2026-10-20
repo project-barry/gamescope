@@ -2972,7 +2972,7 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 
 		if ( fit )
 		{
-			// konkr: a nested-sized override is a fullscreen wrapper, not a dropdown;
+			// pb-os: a nested-sized override is a fullscreen wrapper, not a dropdown;
 			// fitting it would stop 720p swapchains from scaling up.
 			const bool bFitIsNestedSized =
 				fit->GetGeometry().nWidth >= (int)currentOutputWidth - 2 &&
@@ -5372,9 +5372,9 @@ const char *get_win_display_name(steamcompmgr_win_t *window)
 }
 
 
-// konkr: Steam app id that currently owns the shared Android window, set by
-// konkr-apk on the root window before it starts an app.
-static uint32_t g_unKonkrAndroidAppId = 0;
+// pb-os: Steam app id that currently owns the shared Android window, set by
+// pbos-apk on the root window before it starts an app.
+static uint32_t g_unPbosAndroidAppId = 0;
 
 static std::vector< steamcompmgr_win_t* >
 steamcompmgr_xdg_get_possible_focus_windows()
@@ -5382,8 +5382,8 @@ steamcompmgr_xdg_get_possible_focus_windows()
 	std::vector< steamcompmgr_win_t* > windows;
 	for ( auto &win : g_steamcompmgr_xdg_wins )
 	{
-		if ( win->bKonkrAndroid )
-			win->appID = g_unKonkrAndroidAppId;
+		if ( win->bPbosAndroid )
+			win->appID = g_unPbosAndroidAppId;
 
 		// Always skip system tray icons and overlays
 		if ( win->isSysTrayIcon || win->isOverlay || win->isExternalOverlay )
@@ -5541,7 +5541,7 @@ determine_and_apply_focus( global_focus_t *pFocus )
 	{
 		if ( focusable_window->type != steamcompmgr_win_type_t::XWAYLAND )
 		{
-			// konkr: report xdg-shell apps (e.g. Lepton's Android window) too, or
+			// pb-os: report xdg-shell apps (e.g. Lepton's Android window) too, or
 			// Steam never sees the game's window and keeps its launch screen up.
 			uint32_t unXdgAppID = focusable_window->appID;
 			if ( focusable_window->type == steamcompmgr_win_type_t::XDG && unXdgAppID != 0 )
@@ -7457,9 +7457,9 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 		get_prop( ctx, ctx->root, ctx->atoms.gamescopeCtrlAppIDAtom, vecFocuscontrolAppIDs );
 		MakeFocusDirty();
 	}
-	if ( ev->atom == ctx->atoms.konkrAndroidAppIDAtom )
+	if ( ev->atom == ctx->atoms.pbosAndroidAppIDAtom )
 	{
-		g_unKonkrAndroidAppId = get_prop( ctx, ctx->root, ctx->atoms.konkrAndroidAppIDAtom, 0 );
+		g_unPbosAndroidAppId = get_prop( ctx, ctx->root, ctx->atoms.pbosAndroidAppIDAtom, 0 );
 		MakeFocusDirty();
 	}
 	if (ev->atom == ctx->atoms.gamescopeCtrlWindowAtom )
@@ -9636,7 +9636,7 @@ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_
 	ctx->atoms.gamescopeFocusedAppGfxAtom = XInternAtom( ctx->dpy, "GAMESCOPE_FOCUSED_APP_GFX", false );
 	ctx->atoms.gamescopeFocusedWindowAtom = XInternAtom( ctx->dpy, "GAMESCOPE_FOCUSED_WINDOW", false );
 	ctx->atoms.gamescopeCtrlAppIDAtom = XInternAtom(ctx->dpy, "GAMESCOPECTRL_BASELAYER_APPID", false);
-	ctx->atoms.konkrAndroidAppIDAtom = XInternAtom(ctx->dpy, "KONKR_ANDROID_APPID", false);
+	ctx->atoms.pbosAndroidAppIDAtom = XInternAtom(ctx->dpy, "PBOS_ANDROID_APPID", false);
 	ctx->atoms.gamescopeCtrlWindowAtom = XInternAtom(ctx->dpy, "GAMESCOPECTRL_BASELAYER_WINDOW", false);
 	ctx->atoms.WMChangeStateAtom = XInternAtom(ctx->dpy, "WM_CHANGE_STATE", false);
 	ctx->atoms.gamescopeInputCounterAtom = XInternAtom(ctx->dpy, "GAMESCOPE_INPUT_COUNTER", false);
