@@ -4041,6 +4041,31 @@ static gamescope::TouchClickMode wlserver_touch_click_mode()
 	return GetBackend()->GetTouchClickMode();
 }
 
+// pb-os: while Steam's on-screen keyboard is up, Steam's window takes every
+// touch (STEAM_INPUT_FOCUS 2), so nothing beside the keyboard can be tapped:
+// not the text field it types into, not the rest of the app. PBOS_KEYBOARD_RECT
+// (the PB-OS tab sets it while the keyboard is up) says where the keyboard
+// is; a touch that starts outside it goes to the window the keyboard types
+// into, and its motion and lift follow it there.
+static struct { uint32_t x, y, w, h; } s_KeyboardRect;
+static std::set< int > s_KeyboardBesideIds;
+
+void wlserver_set_keyboard_rect( uint32_t x, uint32_t y, uint32_t width, uint32_t height )
+{
+	assert( wlserver_is_lock_held() );
+	s_KeyboardRect = { x, y, width, height };
+}
+
+static bool wlserver_touch_beside_keyboard( double flScreenX, double flScreenY )
+{
+	const auto &r = s_KeyboardRect;
+	if ( !r.w || !r.h )
+		return false;
+	if ( !wlserver.kb_focus_surface || wlserver.kb_focus_surface == wlserver.mouse_focus_surface )
+		return false;
+	return flScreenX < r.x || flScreenY < r.y || flScreenX >= double( r.x ) + r.w || flScreenY >= double( r.y ) + r.h;
+}
+
 void wlserver_touchmotion( double x, double y, int touch_id, uint32_t time, bool bAlwaysWarpCursor, gamescope::IBackendConnector* connector )
 {
 	assert( wlserver_is_lock_held() );
@@ -4065,6 +4090,13 @@ void wlserver_touchmotion( double x, double y, int touch_id, uint32_t time, bool
 		auto [nWidth, nHeight] = wlserver_get_cursor_bounds();
 		tx = clamp( tx, 0.0, nWidth - 0.1 );
 		ty = clamp( ty, 0.0, nHeight - 0.1 );
+
+		if ( s_KeyboardBesideIds.count( touch_id ) )
+		{
+			wlr_seat_touch_notify_motion( wlserver.wlr.seat, time, touch_id, tx, ty );
+			bump_input_counter();
+			return;
+		}
 
 		double trackpad_dx, trackpad_dy;
 
@@ -4117,10 +4149,20 @@ void wlserver_touchdown( double x, double y, int touch_id, uint32_t time, gamesc
 
 		tx *= g_nOutputWidth;
 		ty *= g_nOutputHeight;
+		const bool bBesideKeyboard = wlserver_touch_beside_keyboard( tx, ty );
 		tx += focusedWindowOffsetX;
 		ty += focusedWindowOffsetY;
 		tx *= focusedWindowScaleX;
 		ty *= focusedWindowScaleY;
+
+		if ( bBesideKeyboard )
+		{
+			wlr_seat_touch_notify_down( wlserver.wlr.seat, wlserver.kb_focus_surface, time, touch_id, tx, ty );
+			wlserver.touch_down_ids.insert( touch_id );
+			s_KeyboardBesideIds.insert( touch_id );
+			bump_input_counter();
+			return;
+		}
 
 		gamescope::TouchClickMode eMode = wlserver_touch_click_mode();
 
@@ -4192,6 +4234,7 @@ void wlserver_touchup( int touch_id, uint32_t time )
 		wlr_seat_touch_notify_up( wlserver.wlr.seat, time, touch_id );
 		wlserver.touch_down_ids.erase( touch_id );
 	}
+	s_KeyboardBesideIds.erase( touch_id );
 
 	wlserver_drag_anchor_release();
 	bump_input_counter();

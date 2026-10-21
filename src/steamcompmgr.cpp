@@ -7462,6 +7462,19 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 		g_unPbosAndroidAppId = get_prop( ctx, ctx->root, ctx->atoms.pbosAndroidAppIDAtom, 0 );
 		MakeFocusDirty();
 	}
+	// pb-os: where Steam's on-screen keyboard is (x, y, width, height in
+	// screen pixels) while it is up; gone once it closes. See wlserver.cpp.
+	if ( ev->atom == ctx->atoms.pbosKeyboardRectAtom && ev->window == ctx->root )
+	{
+		std::vector< uint32_t > vecRect;
+		get_prop( ctx, ctx->root, ctx->atoms.pbosKeyboardRectAtom, vecRect );
+		wlserver_lock();
+		if ( vecRect.size() == 4 )
+			wlserver_set_keyboard_rect( vecRect[0], vecRect[1], vecRect[2], vecRect[3] );
+		else
+			wlserver_set_keyboard_rect( 0, 0, 0, 0 );
+		wlserver_unlock();
+	}
 	if (ev->atom == ctx->atoms.gamescopeCtrlWindowAtom )
 	{
 		ctx->focusControlWindow = get_prop( ctx, ctx->root, ctx->atoms.gamescopeCtrlWindowAtom, None );
@@ -9637,6 +9650,7 @@ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_
 	ctx->atoms.gamescopeFocusedWindowAtom = XInternAtom( ctx->dpy, "GAMESCOPE_FOCUSED_WINDOW", false );
 	ctx->atoms.gamescopeCtrlAppIDAtom = XInternAtom(ctx->dpy, "GAMESCOPECTRL_BASELAYER_APPID", false);
 	ctx->atoms.pbosAndroidAppIDAtom = XInternAtom(ctx->dpy, "PBOS_ANDROID_APPID", false);
+	ctx->atoms.pbosKeyboardRectAtom = XInternAtom(ctx->dpy, "PBOS_KEYBOARD_RECT", false);
 	ctx->atoms.gamescopeCtrlWindowAtom = XInternAtom(ctx->dpy, "GAMESCOPECTRL_BASELAYER_WINDOW", false);
 	ctx->atoms.WMChangeStateAtom = XInternAtom(ctx->dpy, "WM_CHANGE_STATE", false);
 	ctx->atoms.gamescopeInputCounterAtom = XInternAtom(ctx->dpy, "GAMESCOPE_INPUT_COUNTER", false);

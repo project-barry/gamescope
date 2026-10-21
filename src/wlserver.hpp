@@ -286,6 +286,7 @@ void wlserver_drag_anchor_move( struct wlr_surface *surface, int x, int y, int b
 void wlserver_touchmotion( double x, double y, int touch_id, uint32_t time, bool bAlwaysWarpCursor = false, gamescope::IBackendConnector* connector = nullptr );
 void wlserver_touchdown( double x, double y, int touch_id, uint32_t time, gamescope::IBackendConnector* connector = nullptr );
 void wlserver_touchup( int touch_id, uint32_t time );
+void wlserver_set_keyboard_rect( uint32_t x, uint32_t y, uint32_t width, uint32_t height );
 
 // Where the bottom screen (steamcompmgr's CBottomScreen) shows a window,
 // for the touches of --ignore-touch-device's device: while one is set they
