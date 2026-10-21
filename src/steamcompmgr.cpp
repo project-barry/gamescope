@@ -2719,6 +2719,16 @@ void MouseCursor::paint(steamcompmgr_win_t *window, steamcompmgr_win_t *fit, str
 	int32_t sourceWidth = window->GetGeometry().nWidth;
 	int32_t sourceHeight = window->GetGeometry().nHeight;
 
+	// pb-os: an xdg window (Lepton's Android) has no geometry here, so the
+	// cursor was placed for a 0x0 window centered on the screen: half a
+	// screen off, and stuck past the middle. Its surface's size is what is
+	// shown.
+	if ( window->type == steamcompmgr_win_type_t::XDG && ( sourceWidth <= 0 || sourceHeight <= 0 ) && window->main_surface() )
+	{
+		sourceWidth = window->main_surface()->current.width;
+		sourceHeight = window->main_surface()->current.height;
+	}
+
 	if ( fit )
 	{
 		// If we have an override window, try to fit it in as long as it won't make our scale go below 1.0.
